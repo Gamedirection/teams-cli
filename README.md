@@ -6,12 +6,8 @@ Go package.
 
 ## Status
 
-The CLI only let you log-in and fetches your user and conversations,
-only the Teams and Channels so far are displayed, but on the background the
-conversations (Groups + DMs) are fetched too.
-  
-This project is still WIP and will be updated soon with new features. The goal is to
-have a CLI / TUI replacement for the Microsoft Teams desktop client.
+This project is actively evolving, and already supports daily messaging workflows
+for Teams channels and chats (including DMs) from a terminal UI.
 
 ## Requirements
 
@@ -35,10 +31,27 @@ If everything goes well, you should see something like this:
 - Logging in into Teams using the token generated via `teams-token`
 - Getting the list of Teams + Channels
 - Reading channels
+- Reading chats/DMs (most recent chats are loaded first)
+- Sending messages in channels and chats/DMs
+- Tab/Shift+Tab to cycle focus between panes
+- Favorites for chats:
+  - Press `f` on a chat to add/remove it from `Chats > Favorites`
+  - Your personal `Private Notes` chat is detected and included in Favorites
+- Press `u` in the chat tree to refresh chat titles with better author/name resolution
 
 ## What doesn't work
 
-- Everything else
+- Some Teams desktop features (calls/meetings/media-rich features) are still not implemented
+
+## Keybindings
+
+- `Tab`: focus next pane
+- `Shift+Tab`: focus previous pane
+- `i`: focus compose input for the selected conversation
+- `Enter` (in compose): send message
+- `Esc` (in compose): return focus to tree
+- `f`: toggle favorite for selected chat
+- `u`: refresh chat names/titles
 
 ## You might also be interested in
 

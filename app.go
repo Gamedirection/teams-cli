@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,17 +36,23 @@ type AppState struct {
 	activeConversationIDs   []string
 	activeConversationTitle string
 	activeConversationNode  *tview.TreeNode
+
+	chatFavoritesMu sync.RWMutex
+	chatFavorites   map[string]bool
 }
 
 type conversationRef struct {
-	ids   []string
-	title string
+	ids        []string
+	title      string
+	chatKey    string
+	isFavorite bool
 }
 
-func (s AppState) createApp() {
+func (s *AppState) createApp() {
 	s.logger.Debug("creating application pages and components")
 	s.pages = tview.NewPages()
 	s.components = map[string]tview.Primitive{}
+	s.chatFavorites = map[string]bool{}
 
 	// Add pages
 	s.pages.AddPage(PageLogin, s.createLoginPage(), true, false)
@@ -123,7 +130,7 @@ func (s *AppState) createMainView() tview.Primitive {
 	chatView.SetBackgroundColor(tcell.ColorBlack)
 	composeView := tview.NewInputField().
 		SetLabel("Message: ").
-		SetPlaceholder("Press i to compose, Enter to send, Esc to return")
+		SetPlaceholder("Press i to compose, f to toggle favorite chat, Enter to send, Esc to return")
 	composeView.SetFieldWidth(0)
 	composeView.SetBorder(true)
 	composeView.SetTitle("Compose")
@@ -304,6 +311,10 @@ func (s *AppState) fillMainWindow() {
 	teamsNode.SetColor(tcell.ColorBlue)
 	chatsNode := tview.NewTreeNode("Chats")
 	chatsNode.SetColor(tcell.ColorYellow)
+	favoritesNode := tview.NewTreeNode("Favorites")
+	favoritesNode.SetColor(tcell.ColorYellow)
+	recentNode := tview.NewTreeNode("Recent")
+	recentNode.SetColor(tcell.ColorYellow)
 
 	var firstNode *tview.TreeNode
 	var mostRecentChatNode *tview.TreeNode
@@ -329,6 +340,7 @@ func (s *AppState) fillMainWindow() {
 	s.logger.WithField("teams_count", len(s.conversations.Teams)).Debug("teams tree nodes prepared")
 
 	chats := append([]csa.Chat(nil), s.conversations.Chats...)
+	chats = ensurePrivateNotesChat(chats, s.conversations.PrivateFeeds)
 	sort.Slice(chats, func(i, j int) bool {
 		ti := chatLastActivity(chats[i])
 		tj := chatLastActivity(chats[j])
@@ -340,10 +352,6 @@ func (s *AppState) fillMainWindow() {
 	for _, chat := range chats {
 		if strings.TrimSpace(chat.Id) == "" {
 			s.logger.Debug("skipping chat with empty id")
-			continue
-		}
-		if isUnsupportedChatID(chat.Id) {
-			s.logger.WithField("chat_id", chat.Id).Debug("skipping unsupported chat id")
 			continue
 		}
 		chatName := buildChatDisplayName(chat, s.me)
@@ -359,9 +367,13 @@ func (s *AppState) fillMainWindow() {
 		}).Debug("prepared chat node")
 		chatNode := tview.NewTreeNode(chatName)
 		chatNode.SetColor(tcell.ColorGreen)
+		chatKey := chatFavoriteKey(chat.Id, candidateIDs)
+		isFavorite := s.chatIsFavorite(chat, chatKey)
 		chatNode.SetReference(conversationRef{
-			ids:   candidateIDs,
-			title: chatName,
+			ids:        candidateIDs,
+			title:      chatName,
+			chatKey:    chatKey,
+			isFavorite: isFavorite,
 		})
 		if firstNode == nil {
 			firstNode = chatNode
@@ -369,10 +381,24 @@ func (s *AppState) fillMainWindow() {
 		if mostRecentChatNode == nil {
 			mostRecentChatNode = chatNode
 		}
-		chatsNode.AddChild(chatNode)
+		if isFavorite {
+			favoritesNode.AddChild(chatNode)
+			continue
+		}
+		recentNode.AddChild(chatNode)
+	}
+	if len(favoritesNode.GetChildren()) > 0 {
+		chatsNode.AddChild(favoritesNode)
+	}
+	if len(recentNode.GetChildren()) > 0 {
+		chatsNode.AddChild(recentNode)
 	}
 	rootNode.AddChild(chatsNode)
-	s.logger.WithField("chat_nodes_count", len(chatsNode.GetChildren())).Debug("chat tree nodes prepared")
+	s.logger.WithFields(logrus.Fields{
+		"chat_nodes_count":      len(favoritesNode.GetChildren()) + len(recentNode.GetChildren()),
+		"favorites_nodes_count": len(favoritesNode.GetChildren()),
+		"recent_nodes_count":    len(recentNode.GetChildren()),
+	}).Debug("chat tree nodes prepared")
 
 	treeView.SetSelectedFunc(func(node *tview.TreeNode) {
 		s.logger.WithField("node_text", node.GetText()).Debug("tree node selected")
@@ -418,6 +444,12 @@ func (s *AppState) fillMainWindow() {
 		}
 	})
 	treeView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyRune && (event.Rune() == 'f' || event.Rune() == 'F') {
+			if s.toggleFavoriteForCurrentNode(treeView, chatsNode, favoritesNode, recentNode) {
+				return nil
+			}
+			return event
+		}
 		if event.Key() == tcell.KeyRune && (event.Rune() == 'u' || event.Rune() == 'U') {
 			go s.refreshAllChatLabels(chatsNode)
 			return nil
@@ -495,6 +527,9 @@ func (s *AppState) getActiveConversation() ([]string, string, *tview.TreeNode) {
 }
 
 func buildChatDisplayName(chat csa.Chat, me *models.User) string {
+	if isPrivateNotesChat(chat) {
+		return "Private Notes"
+	}
 	if strings.TrimSpace(chat.Title) != "" {
 		return chat.Title
 	}
@@ -525,6 +560,63 @@ func buildChatDisplayName(chat csa.Chat, me *models.User) string {
 		return "Chat"
 	}
 	return "Private Chat"
+}
+
+func (s *AppState) chatIsFavorite(chat csa.Chat, chatKey string) bool {
+	key := normalizeFavoriteKey(chatKey)
+	if key != "" {
+		s.chatFavoritesMu.RLock()
+		favorite, ok := s.chatFavorites[key]
+		s.chatFavoritesMu.RUnlock()
+		if ok {
+			return favorite
+		}
+	}
+	return isPrivateNotesChat(chat)
+}
+
+func (s *AppState) toggleChatFavorite(chatKey string, current bool) bool {
+	key := normalizeFavoriteKey(chatKey)
+	if key == "" {
+		return current
+	}
+	next := !current
+	s.chatFavoritesMu.Lock()
+	if s.chatFavorites == nil {
+		s.chatFavorites = map[string]bool{}
+	}
+	s.chatFavorites[key] = next
+	s.chatFavoritesMu.Unlock()
+	return next
+}
+
+func (s *AppState) toggleFavoriteForCurrentNode(treeView *tview.TreeView, chatsNode, favoritesNode, recentNode *tview.TreeNode) (handled bool) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.WithFields(logrus.Fields{
+				"panic": recovered,
+				"stack": string(debug.Stack()),
+			}).Error("panic while toggling favorite")
+			handled = true
+		}
+	}()
+
+	if treeView == nil {
+		return false
+	}
+	selected := treeView.GetCurrentNode()
+	if selected == nil {
+		return false
+	}
+	ref, ok := selected.GetReference().(conversationRef)
+	if !ok || strings.TrimSpace(ref.chatKey) == "" {
+		return false
+	}
+	ref.isFavorite = s.toggleChatFavorite(ref.chatKey, ref.isFavorite)
+	selected.SetReference(ref)
+	moveChatNodeToGroup(chatsNode, favoritesNode, recentNode, selected, ref.isFavorite)
+	treeView.SetCurrentNode(selected)
+	return true
 }
 
 func resolveDMDisplayName(currentName string, messages []csa.ChatMessage, me *models.User) string {
@@ -657,17 +749,12 @@ func candidateConversationIds(chat csa.Chat, feeds []csa.PrivateFeed) []string {
 	return candidates
 }
 
-func isUnsupportedChatID(chatID string) bool {
-	id := strings.ToLower(strings.TrimSpace(chatID))
-	return strings.HasPrefix(id, "48:notes")
-}
-
 func (s *AppState) refreshAllChatLabels(chatsNode *tview.TreeNode) {
 	if chatsNode == nil {
 		return
 	}
 
-	nodes := chatsNode.GetChildren()
+	nodes := flattenConversationNodes(chatsNode)
 	updated := 0
 	attempted := 0
 	for _, node := range nodes {
@@ -704,18 +791,132 @@ func (s *AppState) refreshAllChatLabels(chatsNode *tview.TreeNode) {
 	}).Info("finished refreshing chat titles")
 }
 
-func extractConversationID(targetLink string) string {
-	const marker = "/conversations/"
-	start := strings.Index(targetLink, marker)
-	if start < 0 {
+func flattenConversationNodes(root *tview.TreeNode) []*tview.TreeNode {
+	if root == nil {
+		return nil
+	}
+
+	var nodes []*tview.TreeNode
+	for _, child := range root.GetChildren() {
+		if _, ok := child.GetReference().(conversationRef); ok {
+			nodes = append(nodes, child)
+			continue
+		}
+		nodes = append(nodes, flattenConversationNodes(child)...)
+	}
+	return nodes
+}
+
+func moveChatNodeToGroup(chatsNode, favoritesNode, recentNode, node *tview.TreeNode, favorite bool) {
+	if node == nil || chatsNode == nil || favoritesNode == nil || recentNode == nil {
+		return
+	}
+	favoritesNode.RemoveChild(node)
+	recentNode.RemoveChild(node)
+
+	if favorite {
+		favoritesNode.AddChild(node)
+	} else {
+		recentNode.AddChild(node)
+	}
+
+	chatsNode.ClearChildren()
+	if len(favoritesNode.GetChildren()) > 0 {
+		chatsNode.AddChild(favoritesNode)
+	}
+	if len(recentNode.GetChildren()) > 0 {
+		chatsNode.AddChild(recentNode)
+	}
+}
+
+func isPrivateNotesChat(chat csa.Chat) bool {
+	return isPrivateNotesConversationID(chat.Id)
+}
+
+func isPrivateNotesConversationID(conversationID string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(conversationID)), "48:notes")
+}
+
+func chatFavoriteKey(chatID string, conversationIDs []string) string {
+	if key := normalizeFavoriteKey(chatID); key != "" {
+		return key
+	}
+	for _, id := range conversationIDs {
+		if key := normalizeFavoriteKey(id); key != "" {
+			return key
+		}
+	}
+	return ""
+}
+
+func normalizeFavoriteKey(chatID string) string {
+	id := strings.TrimSpace(strings.ToLower(chatID))
+	if id == "" {
 		return ""
 	}
-	start += len(marker)
-	end := strings.Index(targetLink[start:], "/")
-	if end < 0 {
-		return targetLink[start:]
+	if idx := strings.Index(id, "?"); idx >= 0 {
+		id = id[:idx]
 	}
-	return targetLink[start : start+end]
+	if idx := strings.Index(id, "#"); idx >= 0 {
+		id = id[:idx]
+	}
+	return strings.TrimSpace(id)
+}
+
+func ensurePrivateNotesChat(chats []csa.Chat, feeds []csa.PrivateFeed) []csa.Chat {
+	for _, chat := range chats {
+		if isPrivateNotesChat(chat) {
+			return chats
+		}
+	}
+
+	for _, feed := range feeds {
+		notesID := extractConversationID(feed.TargetLink)
+		if notesID == "" && isPrivateNotesConversationID(feed.Id) {
+			notesID = feed.Id
+		}
+		if !isPrivateNotesConversationID(notesID) {
+			continue
+		}
+		return append(chats, csa.Chat{
+			Id:          notesID,
+			Title:       "Private Notes",
+			LastMessage: feed.LastMessage,
+		})
+	}
+
+	return chats
+}
+
+func extractConversationID(targetLink string) string {
+	link := strings.TrimSpace(targetLink)
+	if link == "" {
+		return ""
+	}
+	lower := strings.ToLower(link)
+
+	if start := strings.Index(lower, "/chat/"); start >= 0 {
+		start += len("/chat/")
+		rest := link[start:]
+		restLower := lower[start:]
+		if end := strings.Index(restLower, "/conversations"); end >= 0 {
+			return normalizeFavoriteKey(rest[:end])
+		}
+	}
+
+	if start := strings.Index(lower, "/conversations/"); start >= 0 {
+		start += len("/conversations/")
+		rest := link[start:]
+		end := len(rest)
+		for _, marker := range []string{"/", "?", "#"} {
+			if idx := strings.Index(rest, marker); idx >= 0 && idx < end {
+				end = idx
+			}
+		}
+		return normalizeFavoriteKey(rest[:end])
+	}
+
+	return ""
 }
 
 func textMessage(input string) string {
