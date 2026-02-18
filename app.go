@@ -3,27 +3,37 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"github.com/dgrijalva/jwt-go"
 	teams_api "github.com/fossteams/teams-api"
+	api "github.com/fossteams/teams-api/pkg"
 	"github.com/fossteams/teams-api/pkg/csa"
+	"github.com/fossteams/teams-api/pkg/models"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/html"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type AppState struct {
-	app   *tview.Application
-	pages *tview.Pages
+	app    *tview.Application
+	pages  *tview.Pages
 	logger *logrus.Logger
 
 	TeamsState
 	components map[string]tview.Primitive
 }
 
+type conversationRef struct {
+	ids   []string
+	title string
+}
+
 func (s AppState) createApp() {
+	s.logger.Debug("creating application pages and components")
 	s.pages = tview.NewPages()
 	s.components = map[string]tview.Primitive{}
 
@@ -44,6 +54,7 @@ func (s AppState) createApp() {
 	s.pages.SwitchToPage(PageLogin)
 	s.app.SetFocus(s.pages)
 
+	s.logger.Debug("starting async app initialization")
 	go s.start()
 }
 
@@ -82,31 +93,112 @@ func (s *AppState) createLoginPage() tview.Primitive {
 		AddItem(nil, 0, 1, false).
 		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
 			AddItem(nil, 0, 1, false).
-			AddItem(p,  10, 1, false).
+			AddItem(p, 10, 1, false).
 			AddItem(nil, 0, 1, false), 30, 1, false).
 		AddItem(nil, 0, 1, false)
 }
 
 func (s *AppState) start() {
+	s.logTokenDiagnostics()
+
+	s.logger.Info("initializing Teams client")
 	// Initialize Teams client
 	var err error
 	s.teamsClient, err = teams_api.New()
 	if err != nil {
+		s.logger.WithError(err).Error("teams client initialization failed")
 		s.showError(err)
 		return
 	}
+	s.logger.Info("Teams client initialized")
 
 	// Initialize Teams State
+	s.TeamsState.logger = s.logger
+	s.logger.Info("initializing Teams state")
 	err = s.TeamsState.init(s.teamsClient)
 	if err != nil {
+		s.logger.WithError(err).Error("teams state initialization failed")
 		s.showError(err)
 		return
 	}
+	s.logger.Info("Teams state initialized")
 
 	go s.fillMainWindow()
 }
 
+func (s *AppState) logTokenDiagnostics() {
+	s.logger.Info("running token/auth diagnostics")
+
+	skypeSpacesToken, err := api.GetSkypeSpacesToken()
+	if err != nil {
+		s.logger.WithError(err).Error("unable to load skype token")
+	} else {
+		logTokenMeta(s.logger, "skype", skypeSpacesToken)
+	}
+
+	chatSvcToken, err := api.GetChatSvcAggToken()
+	if err != nil {
+		s.logger.WithError(err).Error("unable to load chatsvcagg token")
+	} else {
+		logTokenMeta(s.logger, "chatsvcagg", chatSvcToken)
+	}
+
+	_, err = api.GetSkypeToken()
+	if err != nil {
+		s.logger.WithError(err).Error("unable to refresh skype token via authz")
+	} else {
+		s.logger.Info("skype token refresh via authz succeeded")
+	}
+}
+
+func logTokenMeta(logger *logrus.Logger, name string, token *api.TeamsToken) {
+	if logger == nil {
+		return
+	}
+	if token == nil || token.Inner == nil {
+		logger.WithField("token_name", name).Warn("token is nil")
+		return
+	}
+	exp, ok := tokenExpiry(token)
+	if !ok {
+		logger.WithField("token_name", name).Warn("token has no parseable exp claim")
+		return
+	}
+	logger.WithFields(logrus.Fields{
+		"token_name":   name,
+		"expires_at":   exp.Format(time.RFC3339),
+		"is_expired":   time.Now().After(exp),
+		"minutes_left": int(time.Until(exp).Minutes()),
+	}).Info("token metadata")
+}
+
+func tokenExpiry(token *api.TeamsToken) (time.Time, bool) {
+	if token == nil || token.Inner == nil {
+		return time.Time{}, false
+	}
+	claims, ok := token.Inner.Claims.(jwt.MapClaims)
+	if !ok {
+		return time.Time{}, false
+	}
+	rawExp, ok := claims["exp"]
+	if !ok {
+		return time.Time{}, false
+	}
+
+	switch exp := rawExp.(type) {
+	case float64:
+		return time.Unix(int64(exp), 0), true
+	case int64:
+		return time.Unix(exp, 0), true
+	case int:
+		return time.Unix(int64(exp), 0), true
+	default:
+		return time.Time{}, false
+	}
+}
+
 func (s *AppState) showError(err error) {
+	s.logger.WithError(err).Error("showing error page")
 	val, ok := s.components[TvError]
 	if !ok {
 		s.logger.Fatalf("unable to show error on screen: %v", err)
@@ -132,14 +224,19 @@ func (s *AppState) createErrorView() tview.Primitive {
 		AddItem(nil, 0, 1, false).
 		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
 			AddItem(nil, 0, 1, false).
-			AddItem(p,  10, 1, false).
+			AddItem(p, 10, 1, false).
 			AddItem(nil, 0, 1, false), 60, 1, false).
 		AddItem(nil, 0, 1, false)
 }
 
 func (s *AppState) fillMainWindow() {
+	s.logger.Debug("building main window tree")
 	treeView := s.components[TrChat].(*tview.TreeView)
+	rootNode := tview.NewTreeNode("Conversations")
 	teamsNode := tview.NewTreeNode("Teams")
+	teamsNode.SetColor(tcell.ColorBlue)
+	chatsNode := tview.NewTreeNode("Chats")
+	chatsNode.SetColor(tcell.ColorYellow)
 
 	var firstNode *tview.TreeNode
 	for _, t := range s.conversations.Teams {
@@ -160,35 +257,319 @@ func (s *AppState) fillMainWindow() {
 
 		teamsNode.AddChild(currentTeamTreeNode)
 	}
+	rootNode.AddChild(teamsNode)
+	s.logger.WithField("teams_count", len(s.conversations.Teams)).Debug("teams tree nodes prepared")
+
+	chats := append([]csa.Chat(nil), s.conversations.Chats...)
+	sort.Slice(chats, func(i, j int) bool {
+		return buildChatDisplayName(chats[i], s.me) < buildChatDisplayName(chats[j], s.me)
+	})
+	for _, chat := range chats {
+		if strings.TrimSpace(chat.Id) == "" {
+			s.logger.Debug("skipping chat with empty id")
+			continue
+		}
+		if isUnsupportedChatID(chat.Id) {
+			s.logger.WithField("chat_id", chat.Id).Debug("skipping unsupported chat id")
+			continue
+		}
+		chatName := buildChatDisplayName(chat, s.me)
+		candidateIDs := candidateConversationIds(chat, s.conversations.PrivateFeeds)
+		s.logger.WithFields(logrus.Fields{
+			"chat_title":      chatName,
+			"chat_id":         chat.Id,
+			"is_one_on_one":   chat.IsOneOnOne,
+			"candidate_ids":   strings.Join(candidateIDs, ","),
+			"member_count":    len(chat.Members),
+			"last_container":  chat.LastMessage.ContainerId,
+			"last_message_id": chat.LastMessage.Id,
+		}).Debug("prepared chat node")
+		chatNode := tview.NewTreeNode(chatName)
+		chatNode.SetColor(tcell.ColorGreen)
+		chatNode.SetReference(conversationRef{
+			ids:   candidateIDs,
+			title: chatName,
+		})
+		if firstNode == nil {
+			firstNode = chatNode
+		}
+		chatsNode.AddChild(chatNode)
+	}
+	rootNode.AddChild(chatsNode)
+	s.logger.WithField("chat_nodes_count", len(chatsNode.GetChildren())).Debug("chat tree nodes prepared")
 
 	treeView.SetSelectedFunc(func(node *tview.TreeNode) {
+		s.logger.WithField("node_text", node.GetText()).Debug("tree node selected")
 		reference := node.GetReference()
 		if reference == nil {
+			node.SetExpanded(!node.IsExpanded())
 			return
 		}
 
 		children := node.GetChildren()
-		if len(children) == 0 {
-			channelRef := reference.(csa.Channel)
+		if len(children) > 0 {
+			// Collapse if visible, expand if collapsed.
+			node.SetExpanded(!node.IsExpanded())
+			return
+		}
+
+		switch ref := reference.(type) {
+		case csa.Channel:
+			channelRef := ref
+			s.logger.WithFields(logrus.Fields{
+				"target":          "team-channel",
+				"display_name":    channelRef.DisplayName,
+				"conversation_id": channelRef.Id,
+			}).Info("loading conversation")
 			s.components[ViChat].(*tview.List).
 				SetTitle(channelRef.DisplayName).
 				SetBorder(true).
 				SetTitleAlign(tview.AlignCenter)
-
-			// Load Conversations here
 			go s.loadConversations(&channelRef)
-		} else {
-			// Collapse if visible, expand if collapsed.
-			node.SetExpanded(!node.IsExpanded())
+		case conversationRef:
+			s.logger.WithFields(logrus.Fields{
+				"target":        "chat",
+				"display_name":  ref.title,
+				"candidate_ids": strings.Join(ref.ids, ","),
+			}).Info("loading conversation")
+			s.components[ViChat].(*tview.List).
+				SetTitle(ref.title).
+				SetBorder(true).
+				SetTitleAlign(tview.AlignCenter)
+			go s.loadConversationsByIDs(node, ref.ids, ref.title)
 		}
 	})
+	treeView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyRune && (event.Rune() == 'u' || event.Rune() == 'U') {
+			go s.refreshAllChatLabels(chatsNode)
+			return nil
+		}
+		return event
+	})
 
-	treeView.SetRoot(teamsNode)
-	treeView.SetCurrentNode(firstNode)
+	treeView.SetRoot(rootNode)
+	if firstNode != nil {
+		treeView.SetCurrentNode(firstNode)
+	} else {
+		treeView.SetCurrentNode(rootNode)
+	}
 
 	s.pages.SwitchToPage(PageMain)
 	s.app.SetFocus(treeView)
 	s.app.Draw()
+	s.logger.Info("main window ready")
+}
+
+func buildChatDisplayName(chat csa.Chat, me *models.User) string {
+	if strings.TrimSpace(chat.Title) != "" {
+		return chat.Title
+	}
+
+	memberNames := []string{}
+	seen := map[string]struct{}{}
+	for _, member := range chat.Members {
+		if isCurrentUser(member, me) {
+			continue
+		}
+		name := strings.TrimSpace(member.FriendlyName)
+		if isSelfDisplayName(name, me) {
+			continue
+		}
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		memberNames = append(memberNames, name)
+	}
+	if len(memberNames) > 0 {
+		return strings.Join(memberNames, ", ")
+	}
+	if chat.IsOneOnOne {
+		return "Chat"
+	}
+	return "Private Chat"
+}
+
+func resolveDMDisplayName(currentName string, messages []csa.ChatMessage, me *models.User) string {
+	name := strings.TrimSpace(currentName)
+	if !strings.EqualFold(name, "Chat") && !strings.EqualFold(name, "Direct Message") {
+		return currentName
+	}
+
+	// Prefer the latest non-self author as the DM title.
+	for i := len(messages) - 1; i >= 0; i-- {
+		author := strings.TrimSpace(messages[i].ImDisplayName)
+		if author == "" || isSelfDisplayName(author, me) {
+			continue
+		}
+		return author
+	}
+
+	authorCounts := map[string]int{}
+	for _, message := range messages {
+		author := strings.TrimSpace(message.ImDisplayName)
+		if author == "" || isSelfDisplayName(author, me) {
+			continue
+		}
+		authorCounts[author]++
+	}
+
+	bestAuthor := ""
+	bestCount := 0
+	for author, count := range authorCounts {
+		if count > bestCount || (count == bestCount && strings.ToLower(author) < strings.ToLower(bestAuthor)) {
+			bestAuthor = author
+			bestCount = count
+		}
+	}
+	if bestAuthor != "" {
+		return bestAuthor
+	}
+
+	return currentName
+}
+
+func isSelfDisplayName(name string, me *models.User) bool {
+	if me == nil {
+		return false
+	}
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return false
+	}
+
+	candidates := []string{
+		me.DisplayName,
+		me.GivenName,
+		strings.TrimSpace(me.GivenName + " " + me.Surname),
+		me.Alias,
+		me.Email,
+		me.UserPrincipalName,
+	}
+	for _, candidate := range candidates {
+		candidate = strings.ToLower(strings.TrimSpace(candidate))
+		if candidate != "" && candidate == name {
+			return true
+		}
+	}
+	return false
+}
+
+func isCurrentUser(member csa.ChatMember, me *models.User) bool {
+	if me == nil {
+		return false
+	}
+	if strings.TrimSpace(me.ObjectId) != "" && member.ObjectId == me.ObjectId {
+		return true
+	}
+	if strings.TrimSpace(me.Mri) != "" && member.Mri == me.Mri {
+		return true
+	}
+	return false
+}
+
+func candidateConversationIds(chat csa.Chat, feeds []csa.PrivateFeed) []string {
+	candidates := []string{}
+	seen := map[string]struct{}{}
+
+	for _, id := range []string{chat.Id, chat.LastMessage.ContainerId} {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		candidates = append(candidates, id)
+	}
+
+	for _, feed := range feeds {
+		id := strings.TrimSpace(extractConversationID(feed.TargetLink))
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		if chat.LastMessage.ContainerId != "" && feed.LastMessage.ContainerId != "" && chat.LastMessage.ContainerId != feed.LastMessage.ContainerId {
+			continue
+		}
+		if chat.Id != "" && feed.Id != "" && !strings.Contains(feed.Id, chat.Id) {
+			// keep likely-matching feeds by container id and avoid unrelated links
+			if chat.LastMessage.ContainerId == "" || feed.LastMessage.ContainerId == "" {
+				continue
+			}
+		}
+		seen[id] = struct{}{}
+		candidates = append(candidates, id)
+	}
+
+	return candidates
+}
+
+func isUnsupportedChatID(chatID string) bool {
+	id := strings.ToLower(strings.TrimSpace(chatID))
+	return strings.HasPrefix(id, "48:notes")
+}
+
+func (s *AppState) refreshAllChatLabels(chatsNode *tview.TreeNode) {
+	if chatsNode == nil {
+		return
+	}
+
+	nodes := chatsNode.GetChildren()
+	updated := 0
+	attempted := 0
+	for _, node := range nodes {
+		ref, ok := node.GetReference().(conversationRef)
+		if !ok {
+			continue
+		}
+
+		attempted++
+		title, err := s.resolveConversationTitle(ref.title, ref.ids)
+		if err != nil {
+			s.logger.WithFields(logrus.Fields{
+				"candidate_ids": strings.Join(ref.ids, ","),
+				"display_name":  ref.title,
+				"error":         err.Error(),
+			}).Warn("unable to refresh chat title")
+			continue
+		}
+		if strings.TrimSpace(title) == "" || strings.TrimSpace(title) == strings.TrimSpace(ref.title) {
+			continue
+		}
+
+		ref.title = title
+		updated++
+		s.app.QueueUpdateDraw(func() {
+			node.SetText(title)
+			node.SetReference(ref)
+		})
+	}
+
+	s.logger.WithFields(logrus.Fields{
+		"attempted": attempted,
+		"updated":   updated,
+	}).Info("finished refreshing chat titles")
+}
+
+func extractConversationID(targetLink string) string {
+	const marker = "/conversations/"
+	start := strings.Index(targetLink, marker)
+	if start < 0 {
+		return ""
+	}
+	start += len(marker)
+	end := strings.Index(targetLink[start:], "/")
+	if end < 0 {
+		return targetLink[start:]
+	}
+	return targetLink[start : start+end]
 }
 
 func textMessage(input string) string {
@@ -216,9 +597,85 @@ func textMessage(input string) string {
 }
 
 func (s *AppState) loadConversations(c *csa.Channel) {
-	messages, err := s.teamsClient.GetMessages(c)
+	s.loadConversationsByIDs(nil, []string{c.Id}, c.DisplayName)
+}
 
+func normalizeConversationIDs(conversationIDs []string) []string {
+	ids := []string{}
+	seen := map[string]struct{}{}
+	for _, id := range conversationIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (s *AppState) fetchConversationMessages(displayName string, conversationIDs []string) ([]string, []csa.ChatMessage, error) {
+	ids := normalizeConversationIDs(conversationIDs)
+	if len(ids) == 0 {
+		return nil, nil, fmt.Errorf("no conversation id available")
+	}
+
+	var messages []csa.ChatMessage
+	var err error
+	for idx, id := range ids {
+		s.logger.WithFields(logrus.Fields{
+			"display_name":    displayName,
+			"conversation_id": id,
+			"attempt":         strconv.Itoa(idx + 1),
+		}).Debug("fetching messages")
+		messages, err = s.teamsClient.GetMessages(&csa.Channel{Id: id, DisplayName: displayName})
+		if err == nil {
+			s.logger.WithFields(logrus.Fields{
+				"display_name":    displayName,
+				"conversation_id": id,
+				"attempt":         strconv.Itoa(idx + 1),
+				"messages_count":  len(messages),
+			}).Info("messages loaded")
+			break
+		}
+		s.logger.WithFields(logrus.Fields{
+			"display_name":    displayName,
+			"conversation_id": id,
+			"attempt":         strconv.Itoa(idx + 1),
+			"error":           err.Error(),
+		}).Warn("message fetch failed for conversation id")
+	}
 	if err != nil {
+		return ids, nil, err
+	}
+
+	sort.Sort(csa.SortMessageByTime(messages))
+	return ids, messages, nil
+}
+
+func (s *AppState) resolveConversationTitle(displayName string, conversationIDs []string) (string, error) {
+	_, messages, err := s.fetchConversationMessages(displayName, conversationIDs)
+	if err != nil {
+		return displayName, err
+	}
+	return resolveDMDisplayName(displayName, messages, s.me), nil
+}
+
+func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversationIDs []string, displayName string) {
+	s.logger.WithFields(logrus.Fields{
+		"display_name":  displayName,
+		"incoming_ids":  strings.Join(conversationIDs, ","),
+		"incoming_size": len(conversationIDs),
+	}).Debug("load conversations called")
+	ids, messages, err := s.fetchConversationMessages(displayName, conversationIDs)
+	if err != nil {
+		s.logger.WithFields(logrus.Fields{
+			"display_name":  displayName,
+			"attempted_ids": strings.Join(ids, ","),
+		}).WithError(err).Error("all conversation id attempts failed")
 		s.showError(err)
 		time.Sleep(5 * time.Second)
 		s.pages.SwitchToPage(PageMain)
@@ -226,16 +683,29 @@ func (s *AppState) loadConversations(c *csa.Channel) {
 		s.app.SetFocus(s.pages)
 		return
 	}
+
+	displayName = resolveDMDisplayName(displayName, messages, s.me)
+	if selectedNode != nil && strings.TrimSpace(selectedNode.GetText()) != strings.TrimSpace(displayName) {
+		selectedNode.SetText(displayName)
+		if ref, ok := selectedNode.GetReference().(conversationRef); ok {
+			ref.title = displayName
+			selectedNode.SetReference(ref)
+		}
+	}
+	s.components[ViChat].(*tview.List).
+		SetTitle(displayName).
+		SetBorder(true).
+		SetTitleAlign(tview.AlignCenter)
+
 	// Clear chat
 	chatList := s.components[ViChat].(*tview.List)
 	chatList.Clear()
-
-	// Sort Messages by time
-	sort.Sort(csa.SortMessageByTime(messages))
-
+	s.logger.WithFields(logrus.Fields{
+		"display_name":   displayName,
+		"messages_count": len(messages),
+	}).Debug("rendering messages")
 	for _, message := range messages {
 		if message.ImDisplayName == "" {
-			// Skip messages w/o author
 			continue
 		}
 		chatList.AddItem(textMessage(message.Content), message.ImDisplayName, 0, nil)
