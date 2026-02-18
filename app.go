@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"github.com/dgrijalva/jwt-go"
 	teams_api "github.com/fossteams/teams-api"
@@ -12,9 +13,13 @@ import (
 	"github.com/rivo/tview"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/html"
+	"io"
+	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,6 +30,11 @@ type AppState struct {
 
 	TeamsState
 	components map[string]tview.Primitive
+
+	activeConversationMu    sync.RWMutex
+	activeConversationIDs   []string
+	activeConversationTitle string
+	activeConversationNode  *tview.TreeNode
 }
 
 type conversationRef struct {
@@ -53,9 +63,53 @@ func (s AppState) createApp() {
 	// Set main page
 	s.pages.SwitchToPage(PageLogin)
 	s.app.SetFocus(s.pages)
+	s.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyTAB:
+			s.focusNextPane()
+			return nil
+		case tcell.KeyBacktab:
+			s.focusPrevPane()
+			return nil
+		default:
+			return event
+		}
+	})
 
 	s.logger.Debug("starting async app initialization")
 	go s.start()
+}
+
+func (s *AppState) focusNextPane() {
+	tree := s.components[TrChat]
+	chat := s.components[ViChat]
+	compose := s.components[ViCompose]
+	current := s.app.GetFocus()
+
+	switch current {
+	case tree:
+		s.app.SetFocus(chat)
+	case chat:
+		s.app.SetFocus(compose)
+	default:
+		s.app.SetFocus(tree)
+	}
+}
+
+func (s *AppState) focusPrevPane() {
+	tree := s.components[TrChat]
+	chat := s.components[ViChat]
+	compose := s.components[ViCompose]
+	current := s.app.GetFocus()
+
+	switch current {
+	case compose:
+		s.app.SetFocus(chat)
+	case chat:
+		s.app.SetFocus(tree)
+	default:
+		s.app.SetFocus(compose)
+	}
 }
 
 func (s *AppState) createMainView() tview.Primitive {
@@ -67,13 +121,25 @@ func (s *AppState) createMainView() tview.Primitive {
 	treeView := tview.NewTreeView()
 	chatView := tview.NewList()
 	chatView.SetBackgroundColor(tcell.ColorBlack)
+	composeView := tview.NewInputField().
+		SetLabel("Message: ").
+		SetPlaceholder("Press i to compose, Enter to send, Esc to return")
+	composeView.SetFieldWidth(0)
+	composeView.SetBorder(true)
+	composeView.SetTitle("Compose")
+	composeView.SetTitleAlign(tview.AlignCenter)
 
 	s.components[TrChat] = treeView
 	s.components[ViChat] = chatView
+	s.components[ViCompose] = composeView
+
+	chatPane := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(chatView, 0, 1, false).
+		AddItem(composeView, 3, 0, false)
 
 	flex := tview.NewFlex().
 		AddItem(treeView, 0, 1, false).
-		AddItem(chatView, 0, 2, false)
+		AddItem(chatPane, 0, 2, false)
 
 	return flex
 }
@@ -232,6 +298,7 @@ func (s *AppState) createErrorView() tview.Primitive {
 func (s *AppState) fillMainWindow() {
 	s.logger.Debug("building main window tree")
 	treeView := s.components[TrChat].(*tview.TreeView)
+	composeView := s.components[ViCompose].(*tview.InputField)
 	rootNode := tview.NewTreeNode("Conversations")
 	teamsNode := tview.NewTreeNode("Teams")
 	teamsNode.SetColor(tcell.ColorBlue)
@@ -239,6 +306,7 @@ func (s *AppState) fillMainWindow() {
 	chatsNode.SetColor(tcell.ColorYellow)
 
 	var firstNode *tview.TreeNode
+	var mostRecentChatNode *tview.TreeNode
 	for _, t := range s.conversations.Teams {
 		currentTeamTreeNode := tview.NewTreeNode(t.DisplayName)
 		currentTeamTreeNode.SetReference(t)
@@ -262,6 +330,11 @@ func (s *AppState) fillMainWindow() {
 
 	chats := append([]csa.Chat(nil), s.conversations.Chats...)
 	sort.Slice(chats, func(i, j int) bool {
+		ti := chatLastActivity(chats[i])
+		tj := chatLastActivity(chats[j])
+		if !ti.Equal(tj) {
+			return ti.After(tj)
+		}
 		return buildChatDisplayName(chats[i], s.me) < buildChatDisplayName(chats[j], s.me)
 	})
 	for _, chat := range chats {
@@ -292,6 +365,9 @@ func (s *AppState) fillMainWindow() {
 		})
 		if firstNode == nil {
 			firstNode = chatNode
+		}
+		if mostRecentChatNode == nil {
+			mostRecentChatNode = chatNode
 		}
 		chatsNode.AddChild(chatNode)
 	}
@@ -325,6 +401,7 @@ func (s *AppState) fillMainWindow() {
 				SetTitle(channelRef.DisplayName).
 				SetBorder(true).
 				SetTitleAlign(tview.AlignCenter)
+			s.setActiveConversation(node, []string{channelRef.Id}, channelRef.DisplayName)
 			go s.loadConversations(&channelRef)
 		case conversationRef:
 			s.logger.WithFields(logrus.Fields{
@@ -336,6 +413,7 @@ func (s *AppState) fillMainWindow() {
 				SetTitle(ref.title).
 				SetBorder(true).
 				SetTitleAlign(tview.AlignCenter)
+			s.setActiveConversation(node, ref.ids, ref.title)
 			go s.loadConversationsByIDs(node, ref.ids, ref.title)
 		}
 	})
@@ -344,11 +422,49 @@ func (s *AppState) fillMainWindow() {
 			go s.refreshAllChatLabels(chatsNode)
 			return nil
 		}
+		if event.Key() == tcell.KeyRune && (event.Rune() == 'i' || event.Rune() == 'I') {
+			ids, _, _ := s.getActiveConversation()
+			if len(ids) == 0 {
+				return event
+			}
+			s.app.SetFocus(composeView)
+			return nil
+		}
 		return event
+	})
+	composeView.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEscape {
+			s.app.SetFocus(treeView)
+			return
+		}
+		if key != tcell.KeyEnter {
+			return
+		}
+		messageText := strings.TrimSpace(composeView.GetText())
+		if messageText == "" {
+			return
+		}
+		ids, title, selectedNode := s.getActiveConversation()
+		if len(ids) == 0 {
+			s.showError(fmt.Errorf("select a conversation before sending a message"))
+			return
+		}
+		composeView.SetText("")
+		go s.sendMessageAndRefresh(ids, title, messageText, selectedNode)
 	})
 
 	treeView.SetRoot(rootNode)
-	if firstNode != nil {
+	if mostRecentChatNode != nil {
+		treeView.SetCurrentNode(mostRecentChatNode)
+		if ref, ok := mostRecentChatNode.GetReference().(conversationRef); ok {
+			s.components[ViChat].(*tview.List).
+				SetTitle(ref.title).
+				SetBorder(true).
+				SetTitleAlign(tview.AlignCenter)
+			s.setActiveConversation(mostRecentChatNode, ref.ids, ref.title)
+			go s.loadConversationsByIDs(mostRecentChatNode, ref.ids, ref.title)
+		}
+	} else if firstNode != nil {
 		treeView.SetCurrentNode(firstNode)
 	} else {
 		treeView.SetCurrentNode(rootNode)
@@ -358,6 +474,24 @@ func (s *AppState) fillMainWindow() {
 	s.app.SetFocus(treeView)
 	s.app.Draw()
 	s.logger.Info("main window ready")
+}
+
+func (s *AppState) setActiveConversation(selectedNode *tview.TreeNode, conversationIDs []string, title string) {
+	ids := normalizeConversationIDs(conversationIDs)
+	s.activeConversationMu.Lock()
+	s.activeConversationIDs = ids
+	s.activeConversationTitle = title
+	s.activeConversationNode = selectedNode
+	s.activeConversationMu.Unlock()
+}
+
+func (s *AppState) getActiveConversation() ([]string, string, *tview.TreeNode) {
+	s.activeConversationMu.RLock()
+	ids := append([]string(nil), s.activeConversationIDs...)
+	title := s.activeConversationTitle
+	node := s.activeConversationNode
+	s.activeConversationMu.RUnlock()
+	return ids, title, node
 }
 
 func buildChatDisplayName(chat csa.Chat, me *models.User) string {
@@ -430,6 +564,18 @@ func resolveDMDisplayName(currentName string, messages []csa.ChatMessage, me *mo
 	}
 
 	return currentName
+}
+
+func chatLastActivity(chat csa.Chat) time.Time {
+	compose := time.Time(chat.LastMessage.ComposeTime)
+	if !compose.IsZero() {
+		return compose
+	}
+	arrival := time.Time(chat.LastMessage.OriginalArrivalTime)
+	if !arrival.IsZero() {
+		return arrival
+	}
+	return time.Time{}
 }
 
 func isSelfDisplayName(name string, me *models.User) bool {
@@ -600,6 +746,91 @@ func (s *AppState) loadConversations(c *csa.Channel) {
 	s.loadConversationsByIDs(nil, []string{c.Id}, c.DisplayName)
 }
 
+func (s *AppState) sendMessageAndRefresh(conversationIDs []string, displayName, content string, selectedNode *tview.TreeNode) {
+	err := s.sendMessage(conversationIDs, content)
+	if err != nil {
+		s.showError(err)
+		return
+	}
+	// The send endpoint may acknowledge before the message is visible in reads.
+	for _, delay := range []time.Duration{0, 300 * time.Millisecond, 1 * time.Second, 2 * time.Second} {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		s.loadConversationsByIDs(selectedNode, conversationIDs, displayName)
+	}
+}
+
+func formatOutgoingHTML(content string) string {
+	lines := strings.Split(content, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSpace(lines[i])
+	}
+	body := strings.Join(lines, "<br/>")
+	return "<div><div>" + body + "</div></div>"
+}
+
+func (s *AppState) sendMessage(conversationIDs []string, content string) error {
+	ids := normalizeConversationIDs(conversationIDs)
+	if len(ids) == 0 {
+		return fmt.Errorf("no conversation id available")
+	}
+
+	payload := map[string]interface{}{
+		"content":         formatOutgoingHTML(content),
+		"messagetype":     "RichText/Html",
+		"contenttype":     "text",
+		"clientmessageid": strconv.FormatInt(time.Now().UnixNano(), 10),
+		"amsreferences":   []string{},
+		"properties":      map[string]interface{}{},
+	}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("unable to encode outgoing message: %v", err)
+	}
+
+	var lastErr error
+	for _, id := range ids {
+		endpoint := csa.MessagesHost + "v1/users/ME/conversations/" + url.QueryEscape(id) + "/messages"
+		req, err := s.teamsClient.ChatSvc().AuthenticatedRequest(http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Add("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+			_, _ = io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			s.logger.WithFields(logrus.Fields{
+				"conversation_id": id,
+				"status_code":     resp.StatusCode,
+			}).Info("message sent")
+			return nil
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		lastErr = fmt.Errorf("send failed for %s: status=%d body=%s", id, resp.StatusCode, strings.TrimSpace(string(body)))
+		s.logger.WithFields(logrus.Fields{
+			"conversation_id": id,
+			"status_code":     resp.StatusCode,
+			"response_body":   strings.TrimSpace(string(body)),
+		}).Warn("message send failed for conversation id")
+	}
+
+	if lastErr == nil {
+		return fmt.Errorf("unable to send message")
+	}
+	return lastErr
+}
+
 func normalizeConversationIDs(conversationIDs []string) []string {
 	ids := []string{}
 	seen := map[string]struct{}{}
@@ -705,10 +936,35 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 		"messages_count": len(messages),
 	}).Debug("rendering messages")
 	for _, message := range messages {
-		if message.ImDisplayName == "" {
-			continue
+		author := strings.TrimSpace(message.ImDisplayName)
+		if author == "" {
+			author = inferMessageAuthor(message, s.me)
 		}
-		chatList.AddItem(textMessage(message.Content), message.ImDisplayName, 0, nil)
+		chatList.AddItem(textMessage(message.Content), author, 0, nil)
+	}
+	if chatList.GetItemCount() > 0 {
+		chatList.SetCurrentItem(chatList.GetItemCount() - 1)
 	}
 	s.app.Draw()
+}
+
+func inferMessageAuthor(message csa.ChatMessage, me *models.User) string {
+	if me != nil {
+		from := strings.ToLower(strings.TrimSpace(message.From))
+		if from != "" {
+			if strings.TrimSpace(me.ObjectId) != "" && strings.Contains(from, strings.ToLower(me.ObjectId)) {
+				if strings.TrimSpace(me.DisplayName) != "" {
+					return me.DisplayName
+				}
+				return "You"
+			}
+			if strings.TrimSpace(me.Mri) != "" && strings.Contains(from, strings.ToLower(me.Mri)) {
+				if strings.TrimSpace(me.DisplayName) != "" {
+					return me.DisplayName
+				}
+				return "You"
+			}
+		}
+	}
+	return "Unknown"
 }

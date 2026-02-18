@@ -2,7 +2,7 @@ package main
 
 const (
 	TvLoginStatus = "tvLoginStatus"
-	TvError = "tvErrTitle"
+	TvError       = "tvErrTitle"
 )
 
 // Trees
@@ -13,13 +13,14 @@ const (
 // Generic Views
 
 const (
-	ViChat = "viChat"
+	ViChat    = "viChat"
+	ViCompose = "viCompose"
 )
 
 // Pages
 
 const (
-	PageMain = "pageMain"
+	PageMain  = "pageMain"
 	PageLogin = "pageLogin"
 	PageError = "pageError"
 )
