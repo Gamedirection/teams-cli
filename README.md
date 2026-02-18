@@ -25,6 +25,8 @@ go run ./
 
 If everything goes well, you should see something like this:
 ![Teams CLI example](./docs/screenshots/2021-04-13.png)
+<img width="1708" height="881" alt="image" src="https://github.com/user-attachments/assets/899b4aa5-f00e-4d6b-85b8-7dd9f3b07080" />
+
 
 ## What works
 
