@@ -53,6 +53,17 @@ type AppState struct {
 
 	settingsPath string
 	settingsKey  string
+
+	unreadScanMu       sync.RWMutex
+	unreadScanEnabled  bool
+	unreadScanInterval time.Duration
+	unreadScanStop     chan struct{}
+	unreadScanRunning  bool
+	unreadLastScanAt   time.Time
+	unreadLastChanges  int
+
+	manualUnreadMu sync.RWMutex
+	manualUnread   map[string]bool
 }
 
 type conversationRef struct {
@@ -60,6 +71,7 @@ type conversationRef struct {
 	title      string
 	chatKey    string
 	isFavorite bool
+	isUnread   bool
 }
 
 type encryptedSettingsFile struct {
@@ -79,6 +91,10 @@ func (s *AppState) createApp() {
 	s.components = map[string]tview.Primitive{}
 	s.chatFavorites = map[string]bool{}
 	s.chatTitles = map[string]string{}
+	s.unreadScanEnabled = true
+	s.unreadScanInterval = time.Minute
+	s.unreadScanStop = make(chan struct{})
+	s.manualUnread = map[string]bool{}
 	s.settingsPath, s.settingsKey = defaultSettingsPaths()
 	if err := s.loadEncryptedChatSettings(); err != nil {
 		s.logger.WithError(err).Warn("unable to load encrypted chat settings")
@@ -163,7 +179,7 @@ func (s *AppState) createMainView() tview.Primitive {
 		SetPlaceholder("Press i to compose, f to toggle favorite chat, Enter to send, Esc to return")
 	composeView.SetFieldWidth(0)
 	composeView.SetBorder(true)
-	composeView.SetTitle("Compose")
+	composeView.SetTitle(s.composeTitleWithScanStatus())
 	composeView.SetTitleAlign(tview.AlignCenter)
 
 	s.components[TrChat] = treeView
@@ -447,11 +463,14 @@ func (s *AppState) fillMainWindow() {
 		chatNode := tview.NewTreeNode(chatName)
 		chatNode.SetColor(tcell.ColorGreen)
 		isFavorite := s.chatIsFavorite(chat, chatKey)
+		isUnread := !chat.IsRead
+		chatNode.SetText(formatChatTreeTitle(chatName, isUnread))
 		chatNode.SetReference(conversationRef{
 			ids:        candidateIDs,
 			title:      chatName,
 			chatKey:    chatKey,
 			isFavorite: isFavorite,
+			isUnread:   isUnread,
 		})
 		if firstNode == nil {
 			firstNode = chatNode
@@ -513,6 +532,12 @@ func (s *AppState) fillMainWindow() {
 				"display_name":  ref.title,
 				"candidate_ids": strings.Join(ref.ids, ","),
 			}).Info("loading conversation")
+			if ref.isUnread {
+				ref.isUnread = false
+				s.setManualUnread(ref.chatKey, false)
+				node.SetText(formatChatTreeTitle(ref.title, false))
+				node.SetReference(ref)
+			}
 			s.components[ViChat].(*tview.List).
 				SetTitle(ref.title).
 				SetBorder(true).
@@ -522,6 +547,53 @@ func (s *AppState) fillMainWindow() {
 		}
 	})
 	treeView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				s.logger.WithFields(logrus.Fields{
+					"panic": recovered,
+					"stack": string(debug.Stack()),
+				}).Error("panic in tree input handler")
+			}
+		}()
+
+		if event.Key() == tcell.KeyRune && event.Rune() == 'm' {
+			enabled := s.toggleUnreadScanEnabled()
+			s.logger.WithField("enabled", enabled).Info("unread scan toggle changed")
+			s.updateScanStatusTitle()
+			composeView.SetTitle(s.composeTitleWithScanStatus())
+			return nil
+		}
+		if event.Key() == tcell.KeyRune && event.Rune() == 'M' {
+			if s.markUnreadScanStart() {
+				composeView.SetTitle(s.composeTitleWithScanStatus())
+				go s.refreshUnreadMarkers(chatsNode)
+			} else {
+				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Scan already running")
+			}
+			return nil
+		}
+		if event.Key() == tcell.KeyRune && (event.Rune() == 'r' || event.Rune() == 'R') {
+			selected := treeView.GetCurrentNode()
+			if selected == nil {
+				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Select a chat first")
+				return event
+			}
+			ref, ok := selected.GetReference().(conversationRef)
+			if !ok || strings.TrimSpace(ref.chatKey) == "" {
+				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Select a chat first")
+				return event
+			}
+			ref.isUnread = true
+			s.setManualUnread(ref.chatKey, true)
+			selected.SetText(formatChatTreeTitle(ref.title, true))
+			selected.SetReference(ref)
+			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Marked unread")
+			s.logger.WithFields(logrus.Fields{
+				"chat_key": ref.chatKey,
+				"title":    ref.title,
+			}).Debug("marked chat unread manually")
+			return nil
+		}
 		if event.Key() == tcell.KeyRune && (event.Rune() == 'f' || event.Rune() == 'F') {
 			if s.toggleFavoriteForCurrentNode(treeView, chatsNode, favoritesNode, recentNode) {
 				return nil
@@ -583,6 +655,7 @@ func (s *AppState) fillMainWindow() {
 	s.pages.SwitchToPage(PageMain)
 	s.app.SetFocus(treeView)
 	s.app.Draw()
+	s.startUnreadScanLoop(chatsNode)
 	s.logger.Info("main window ready")
 }
 
@@ -638,6 +711,13 @@ func buildChatDisplayName(chat csa.Chat, me *models.User) string {
 		return "Chat"
 	}
 	return "Private Chat"
+}
+
+func formatChatTreeTitle(title string, unread bool) string {
+	if !unread {
+		return title
+	}
+	return "● " + title
 }
 
 func (s *AppState) chatIsFavorite(chat csa.Chat, chatKey string) bool {
@@ -899,8 +979,9 @@ func (s *AppState) refreshAllChatLabels(chatsNode *tview.TreeNode) {
 		if s.setChatTitle(ref.chatKey, title) {
 			titlesChanged = true
 		}
+		displayTitle := formatChatTreeTitle(ref.title, ref.isUnread)
 		s.app.QueueUpdateDraw(func() {
-			node.SetText(title)
+			node.SetText(displayTitle)
 			node.SetReference(ref)
 		})
 	}
@@ -912,6 +993,188 @@ func (s *AppState) refreshAllChatLabels(chatsNode *tview.TreeNode) {
 		"attempted": attempted,
 		"updated":   updated,
 	}).Info("finished refreshing chat titles")
+}
+
+func (s *AppState) startUnreadScanLoop(chatsNode *tview.TreeNode) {
+	if chatsNode == nil {
+		return
+	}
+	interval := s.unreadScanInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.unreadScanMu.RLock()
+				enabled := s.unreadScanEnabled
+				s.unreadScanMu.RUnlock()
+				if !enabled {
+					continue
+				}
+				if s.markUnreadScanStart() {
+					s.refreshUnreadMarkers(chatsNode)
+				}
+			case <-s.unreadScanStop:
+				return
+			}
+		}
+	}()
+}
+
+func (s *AppState) composeTitleWithScanStatus() string {
+	s.unreadScanMu.RLock()
+	enabled := s.unreadScanEnabled
+	running := s.unreadScanRunning
+	last := s.unreadLastScanAt
+	changes := s.unreadLastChanges
+	s.unreadScanMu.RUnlock()
+
+	status := "OFF"
+	if enabled {
+		status = "ON"
+	}
+	if running {
+		return fmt.Sprintf("Compose | Scan: %s | Scanning...", status)
+	}
+	if !last.IsZero() {
+		return fmt.Sprintf("Compose | Scan: %s | Last: %s (%d)", status, last.Format("15:04:05"), changes)
+	}
+	return fmt.Sprintf("Compose | Scan: %s", status)
+}
+
+func (s *AppState) updateScanStatusTitle() {
+	val, ok := s.components[ViCompose]
+	if !ok {
+		return
+	}
+	input, ok := val.(*tview.InputField)
+	if !ok {
+		return
+	}
+	input.SetTitle(s.composeTitleWithScanStatus())
+}
+
+func (s *AppState) isUnreadScanEnabled() bool {
+	s.unreadScanMu.RLock()
+	enabled := s.unreadScanEnabled
+	s.unreadScanMu.RUnlock()
+	return enabled
+}
+
+func (s *AppState) toggleUnreadScanEnabled() bool {
+	s.unreadScanMu.Lock()
+	s.unreadScanEnabled = !s.unreadScanEnabled
+	enabled := s.unreadScanEnabled
+	s.unreadScanMu.Unlock()
+	return enabled
+}
+
+func (s *AppState) markUnreadScanStart() bool {
+	s.unreadScanMu.Lock()
+	if s.unreadScanRunning {
+		s.unreadScanMu.Unlock()
+		return false
+	}
+	s.unreadScanRunning = true
+	s.unreadScanMu.Unlock()
+	return true
+}
+
+func (s *AppState) markUnreadScanDone(changes int) {
+	s.unreadScanMu.Lock()
+	s.unreadScanRunning = false
+	s.unreadLastScanAt = time.Now()
+	s.unreadLastChanges = changes
+	s.unreadScanMu.Unlock()
+}
+
+func (s *AppState) refreshUnreadMarkers(chatsNode *tview.TreeNode) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.WithFields(logrus.Fields{
+				"panic": recovered,
+				"stack": string(debug.Stack()),
+			}).Error("panic during unread marker refresh")
+			s.markUnreadScanDone(0)
+		}
+	}()
+
+	conversations, err := s.teamsClient.GetConversations()
+	if err != nil && isUnauthorizedError(err) {
+		if refreshErr := s.refreshAuthFromTeamsToken(); refreshErr == nil {
+			conversations, err = s.teamsClient.GetConversations()
+		}
+	}
+	if err != nil || conversations == nil {
+		if err != nil {
+			s.logger.WithError(err).Warn("unable to refresh unread state")
+		}
+		s.markUnreadScanDone(0)
+		return
+	}
+
+	chats := ensurePrivateNotesChat(conversations.Chats, conversations.PrivateFeeds)
+	unreadByKey := map[string]bool{}
+	for _, chat := range chats {
+		key := chatFavoriteKey(chat.Id, candidateConversationIds(chat, conversations.PrivateFeeds))
+		if key == "" {
+			continue
+		}
+		unreadByKey[key] = !chat.IsRead || s.getManualUnread(key)
+	}
+
+	s.app.QueueUpdateDraw(func() {
+		changed := 0
+		nodes := flattenConversationNodes(chatsNode)
+		for _, node := range nodes {
+			ref, ok := node.GetReference().(conversationRef)
+			if !ok || strings.TrimSpace(ref.chatKey) == "" {
+				continue
+			}
+			unread, exists := unreadByKey[normalizeFavoriteKey(ref.chatKey)]
+			if !exists || unread == ref.isUnread {
+				continue
+			}
+			ref.isUnread = unread
+			node.SetText(formatChatTreeTitle(ref.title, unread))
+			node.SetReference(ref)
+			changed++
+		}
+		s.markUnreadScanDone(changed)
+		s.updateScanStatusTitle()
+	})
+}
+
+func (s *AppState) setManualUnread(chatKey string, unread bool) {
+	key := normalizeFavoriteKey(chatKey)
+	if key == "" {
+		return
+	}
+	s.manualUnreadMu.Lock()
+	if s.manualUnread == nil {
+		s.manualUnread = map[string]bool{}
+	}
+	if unread {
+		s.manualUnread[key] = true
+	} else {
+		delete(s.manualUnread, key)
+	}
+	s.manualUnreadMu.Unlock()
+}
+
+func (s *AppState) getManualUnread(chatKey string) bool {
+	key := normalizeFavoriteKey(chatKey)
+	if key == "" {
+		return false
+	}
+	s.manualUnreadMu.RLock()
+	unread := s.manualUnread[key]
+	s.manualUnreadMu.RUnlock()
+	return unread
 }
 
 func flattenConversationNodes(root *tview.TreeNode) []*tview.TreeNode {
@@ -1279,13 +1542,17 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 
 	displayName = resolveDMDisplayName(displayName, messages, s.me)
 	if selectedNode != nil && strings.TrimSpace(selectedNode.GetText()) != strings.TrimSpace(displayName) {
-		selectedNode.SetText(displayName)
 		if ref, ok := selectedNode.GetReference().(conversationRef); ok {
+			ref.isUnread = false
+			s.setManualUnread(ref.chatKey, false)
 			ref.title = displayName
+			selectedNode.SetText(formatChatTreeTitle(ref.title, ref.isUnread))
 			selectedNode.SetReference(ref)
 			if s.setChatTitle(ref.chatKey, displayName) {
 				s.persistEncryptedChatSettings()
 			}
+		} else {
+			selectedNode.SetText(displayName)
 		}
 	}
 	s.components[ViChat].(*tview.List).
