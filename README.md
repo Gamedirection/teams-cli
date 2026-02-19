@@ -85,6 +85,10 @@ If a `401` still reaches the error page, a `Run teams-token` button appears for 
 - Unread marker auto-refresh every minute (toggle with `m`, manual scan with `Shift+M`)
 - Compose title shows scanner status (`ON/OFF`), scan progress, and last scan result
 - Manual mark unread hotkey (`r`) for selected chat
+- Built-in `Settings & Help` chat at the bottom of the tree
+- Message reactions display in chat (`Reactions: ...`)
+- Quick react hotkey in chat (`e` adds 👍 to selected message)
+- Reply mode in chat (`r` replies to selected message)
 - Encrypted persistence of:
   - favorites
   - updated chat titles
@@ -101,7 +105,9 @@ If a `401` still reaches the error page, a `Run teams-token` button appears for 
 - `Esc` (compose): back to tree
 - `f`: toggle favorite for selected/hovered chat
 - `u`: refresh chat titles
-- `r`: mark selected chat unread
+- `r` (tree pane): mark selected chat unread
+- `r` (chat pane): reply to selected message
+- `e` (chat pane): react 👍 to selected message
 - `m`: toggle 1-minute unread scan on/off
 - `Shift+M`: run unread scan immediately
 
