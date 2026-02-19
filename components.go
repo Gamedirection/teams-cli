@@ -3,6 +3,9 @@ package main
 const (
 	TvLoginStatus = "tvLoginStatus"
 	TvError       = "tvErrTitle"
+	BtErrorAuth   = "btErrorAuth"
+	FlErrorBody   = "flErrorBody"
+	FlErrorAction = "flErrorAction"
 )
 
 // Trees
