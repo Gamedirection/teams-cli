@@ -64,6 +64,15 @@ type AppState struct {
 
 	manualUnreadMu sync.RWMutex
 	manualUnread   map[string]bool
+
+	chatMessagesMu sync.RWMutex
+	chatMessages   []csa.ChatMessage
+
+	replyMu      sync.RWMutex
+	pendingReply *replyTarget
+
+	messageReactionsMu sync.RWMutex
+	messageReactions   map[string]string
 }
 
 type conversationRef struct {
@@ -74,6 +83,12 @@ type conversationRef struct {
 	isUnread   bool
 }
 
+type replyTarget struct {
+	MessageID string
+	Author    string
+	Preview   string
+}
+
 type encryptedSettingsFile struct {
 	Version    int    `json:"version"`
 	Nonce      string `json:"nonce"`
@@ -81,9 +96,14 @@ type encryptedSettingsFile struct {
 }
 
 type persistedChatSettings struct {
-	Favorites map[string]bool   `json:"favorites"`
-	Titles    map[string]string `json:"titles"`
+	Favorites       map[string]bool   `json:"favorites"`
+	Titles          map[string]string `json:"titles"`
+	UnreadOverrides map[string]bool   `json:"unread_overrides,omitempty"`
 }
+
+const composeDefaultPlaceholder = "Press i to compose, f to toggle favorite chat, Enter to send, Esc to return"
+const settingsHelpChatKey = "__settings_help__"
+const defaultReactionKey = "like"
 
 func (s *AppState) createApp() {
 	s.logger.Debug("creating application pages and components")
@@ -95,6 +115,7 @@ func (s *AppState) createApp() {
 	s.unreadScanInterval = time.Minute
 	s.unreadScanStop = make(chan struct{})
 	s.manualUnread = map[string]bool{}
+	s.messageReactions = map[string]string{}
 	s.settingsPath, s.settingsKey = defaultSettingsPaths()
 	if err := s.loadEncryptedChatSettings(); err != nil {
 		s.logger.WithError(err).Warn("unable to load encrypted chat settings")
@@ -176,7 +197,7 @@ func (s *AppState) createMainView() tview.Primitive {
 	chatView.SetBackgroundColor(tcell.ColorBlack)
 	composeView := tview.NewInputField().
 		SetLabel("Message: ").
-		SetPlaceholder("Press i to compose, f to toggle favorite chat, Enter to send, Esc to return")
+		SetPlaceholder(composeDefaultPlaceholder)
 	composeView.SetFieldWidth(0)
 	composeView.SetBorder(true)
 	composeView.SetTitle(s.composeTitleWithScanStatus())
@@ -464,6 +485,9 @@ func (s *AppState) fillMainWindow() {
 		chatNode.SetColor(tcell.ColorGreen)
 		isFavorite := s.chatIsFavorite(chat, chatKey)
 		isUnread := !chat.IsRead
+		if override, ok := s.getManualUnreadOverride(chatKey); ok {
+			isUnread = override
+		}
 		chatNode.SetText(formatChatTreeTitle(chatName, isUnread))
 		chatNode.SetReference(conversationRef{
 			ids:        candidateIDs,
@@ -491,6 +515,16 @@ func (s *AppState) fillMainWindow() {
 		chatsNode.AddChild(recentNode)
 	}
 	rootNode.AddChild(chatsNode)
+	settingsNode := tview.NewTreeNode("Settings & Help")
+	settingsNode.SetColor(tcell.ColorLightSkyBlue)
+	settingsNode.SetReference(conversationRef{
+		ids:        []string{},
+		title:      "Settings & Help",
+		chatKey:    settingsHelpChatKey,
+		isFavorite: false,
+		isUnread:   false,
+	})
+	rootNode.AddChild(settingsNode)
 	s.logger.WithFields(logrus.Fields{
 		"chat_nodes_count":      len(favoritesNode.GetChildren()) + len(recentNode.GetChildren()),
 		"favorites_nodes_count": len(favoritesNode.GetChildren()),
@@ -527,6 +561,10 @@ func (s *AppState) fillMainWindow() {
 			s.setActiveConversation(node, []string{channelRef.Id}, channelRef.DisplayName)
 			go s.loadConversations(&channelRef)
 		case conversationRef:
+			if ref.chatKey == settingsHelpChatKey {
+				s.showSettingsHelpChat(ref.title)
+				return
+			}
 			s.logger.WithFields(logrus.Fields{
 				"target":        "chat",
 				"display_name":  ref.title,
@@ -579,7 +617,7 @@ func (s *AppState) fillMainWindow() {
 				return event
 			}
 			ref, ok := selected.GetReference().(conversationRef)
-			if !ok || strings.TrimSpace(ref.chatKey) == "" {
+			if !ok || strings.TrimSpace(ref.chatKey) == "" || ref.chatKey == settingsHelpChatKey {
 				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Select a chat first")
 				return event
 			}
@@ -614,8 +652,63 @@ func (s *AppState) fillMainWindow() {
 		}
 		return event
 	})
+	chatView := s.components[ViChat].(*tview.List)
+	chatView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				s.logger.WithFields(logrus.Fields{
+					"panic": recovered,
+					"stack": string(debug.Stack()),
+				}).Error("panic in chat input handler")
+			}
+		}()
+
+		if event.Key() == tcell.KeyRune && (event.Rune() == 'r' || event.Rune() == 'R') {
+			current := chatView.GetCurrentItem()
+			if current < 0 {
+				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Select a message first")
+				return nil
+			}
+			msg, ok := s.getCurrentChatMessage(current)
+			if !ok {
+				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Select a message first")
+				return nil
+			}
+			author := strings.TrimSpace(msg.ImDisplayName)
+			if author == "" {
+				author = inferMessageAuthor(msg, s.me)
+			}
+			reply := &replyTarget{
+				MessageID: strings.TrimSpace(msg.Id),
+				Author:    author,
+				Preview:   summarizeReplyPreview(msg.Content),
+			}
+			s.setPendingReply(reply)
+			s.updateComposeReplyUI()
+			s.app.SetFocus(composeView)
+			return nil
+		}
+		if event.Key() == tcell.KeyRune && (event.Rune() == 'e' || event.Rune() == 'E') {
+			current := chatView.GetCurrentItem()
+			if current < 0 {
+				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Select a message first")
+				return nil
+			}
+			msg, ok := s.getCurrentChatMessage(current)
+			if !ok || strings.TrimSpace(msg.Id) == "" || strings.TrimSpace(msg.ConversationId) == "" {
+				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Select a message first")
+				return nil
+			}
+			go s.reactToMessage(msg, defaultReactionKey)
+			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Reacted 👍")
+			return nil
+		}
+		return event
+	})
 	composeView.SetDoneFunc(func(key tcell.Key) {
 		if key == tcell.KeyEscape {
+			s.clearPendingReply()
+			s.updateComposeReplyUI()
 			s.app.SetFocus(treeView)
 			return
 		}
@@ -631,8 +724,11 @@ func (s *AppState) fillMainWindow() {
 			s.showError(fmt.Errorf("select a conversation before sending a message"))
 			return
 		}
+		reply := s.getPendingReply()
+		s.clearPendingReply()
+		s.updateComposeReplyUI()
 		composeView.SetText("")
-		go s.sendMessageAndRefresh(ids, title, messageText, selectedNode)
+		go s.sendMessageAndRefresh(ids, title, messageText, selectedNode, reply)
 	})
 
 	treeView.SetRoot(rootNode)
@@ -666,6 +762,28 @@ func (s *AppState) setActiveConversation(selectedNode *tview.TreeNode, conversat
 	s.activeConversationTitle = title
 	s.activeConversationNode = selectedNode
 	s.activeConversationMu.Unlock()
+	s.clearPendingReply()
+	s.updateComposeReplyUI()
+}
+
+func (s *AppState) showSettingsHelpChat(title string) {
+	chatList := s.components[ViChat].(*tview.List)
+	chatList.Clear()
+	chatList.SetTitle(title).
+		SetBorder(true).
+		SetTitleAlign(tview.AlignCenter)
+	chatList.AddItem("teams-cli Help", "Use Tab/Shift+Tab to cycle panes", 0, nil)
+	chatList.AddItem("Favorites", "f on a chat to toggle favorite", 0, nil)
+	chatList.AddItem("Unread Scanner", "m toggle scanner, Shift+M scan now", 0, nil)
+	chatList.AddItem("Manual Unread", "r in tree marks selected chat unread", 0, nil)
+	chatList.AddItem("Reply", "r in chat replies to selected message", 0, nil)
+	chatList.AddItem("React", "e in chat adds 👍 to selected message", 0, nil)
+	chatList.AddItem("Refresh Chat Names", "u refreshes DM titles/authors", 0, nil)
+	chatList.AddItem("Private Notes", "Personal notes chat auto-detected in Favorites", 0, nil)
+
+	s.setCurrentChatMessages(nil)
+	s.setActiveConversation(nil, nil, title)
+	s.app.Draw()
 }
 
 func (s *AppState) getActiveConversation() ([]string, string, *tview.TreeNode) {
@@ -1037,13 +1155,17 @@ func (s *AppState) composeTitleWithScanStatus() string {
 	if enabled {
 		status = "ON"
 	}
+	replySuffix := ""
+	if reply := s.getPendingReply(); reply != nil {
+		replySuffix = " | Reply: " + strings.TrimSpace(reply.Author)
+	}
 	if running {
-		return fmt.Sprintf("Compose | Scan: %s | Scanning...", status)
+		return fmt.Sprintf("Compose | Scan: %s | Scanning...%s", status, replySuffix)
 	}
 	if !last.IsZero() {
-		return fmt.Sprintf("Compose | Scan: %s | Last: %s (%d)", status, last.Format("15:04:05"), changes)
+		return fmt.Sprintf("Compose | Scan: %s | Last: %s (%d)%s", status, last.Format("15:04:05"), changes, replySuffix)
 	}
-	return fmt.Sprintf("Compose | Scan: %s", status)
+	return fmt.Sprintf("Compose | Scan: %s%s", status, replySuffix)
 }
 
 func (s *AppState) updateScanStatusTitle() {
@@ -1054,6 +1176,23 @@ func (s *AppState) updateScanStatusTitle() {
 	input, ok := val.(*tview.InputField)
 	if !ok {
 		return
+	}
+	input.SetTitle(s.composeTitleWithScanStatus())
+}
+
+func (s *AppState) updateComposeReplyUI() {
+	val, ok := s.components[ViCompose]
+	if !ok {
+		return
+	}
+	input, ok := val.(*tview.InputField)
+	if !ok {
+		return
+	}
+	if reply := s.getPendingReply(); reply != nil {
+		input.SetPlaceholder(fmt.Sprintf("Reply to %s: type message and press Enter", strings.TrimSpace(reply.Author)))
+	} else {
+		input.SetPlaceholder(composeDefaultPlaceholder)
 	}
 	input.SetTitle(s.composeTitleWithScanStatus())
 }
@@ -1124,7 +1263,15 @@ func (s *AppState) refreshUnreadMarkers(chatsNode *tview.TreeNode) {
 		if key == "" {
 			continue
 		}
-		unreadByKey[key] = !chat.IsRead || s.getManualUnread(key)
+		unread := !chat.IsRead
+		if override, ok := s.getManualUnreadOverride(key); ok {
+			unread = override
+			if unread == !chat.IsRead {
+				// Override has been reflected by server state.
+				s.clearManualUnreadOverride(key)
+			}
+		}
+		unreadByKey[key] = unread
 	}
 
 	s.app.QueueUpdateDraw(func() {
@@ -1158,23 +1305,139 @@ func (s *AppState) setManualUnread(chatKey string, unread bool) {
 	if s.manualUnread == nil {
 		s.manualUnread = map[string]bool{}
 	}
-	if unread {
-		s.manualUnread[key] = true
-	} else {
+	s.manualUnread[key] = unread
+	s.manualUnreadMu.Unlock()
+	s.persistEncryptedChatSettings()
+}
+
+func (s *AppState) clearManualUnreadOverride(chatKey string) {
+	key := normalizeFavoriteKey(chatKey)
+	if key == "" {
+		return
+	}
+	s.manualUnreadMu.Lock()
+	if s.manualUnread != nil {
 		delete(s.manualUnread, key)
 	}
 	s.manualUnreadMu.Unlock()
 }
 
-func (s *AppState) getManualUnread(chatKey string) bool {
+func (s *AppState) getManualUnreadOverride(chatKey string) (bool, bool) {
 	key := normalizeFavoriteKey(chatKey)
 	if key == "" {
-		return false
+		return false, false
 	}
 	s.manualUnreadMu.RLock()
-	unread := s.manualUnread[key]
+	unread, ok := s.manualUnread[key]
 	s.manualUnreadMu.RUnlock()
-	return unread
+	return unread, ok
+}
+
+func (s *AppState) setCurrentChatMessages(messages []csa.ChatMessage) {
+	copied := append([]csa.ChatMessage(nil), messages...)
+	s.chatMessagesMu.Lock()
+	s.chatMessages = copied
+	s.chatMessagesMu.Unlock()
+}
+
+func (s *AppState) getCurrentChatMessage(index int) (csa.ChatMessage, bool) {
+	s.chatMessagesMu.RLock()
+	defer s.chatMessagesMu.RUnlock()
+	if index < 0 || index >= len(s.chatMessages) {
+		return csa.ChatMessage{}, false
+	}
+	return s.chatMessages[index], true
+}
+
+func summarizeReplyPreview(content string) string {
+	preview := strings.TrimSpace(strings.Join(strings.Fields(textMessage(content)), " "))
+	if preview == "" {
+		return "(message)"
+	}
+	if len(preview) > 80 {
+		return preview[:77] + "..."
+	}
+	return preview
+}
+
+func reactionMessageKey(conversationID, messageID string) string {
+	conv := normalizeFavoriteKey(conversationID)
+	msg := normalizeFavoriteKey(messageID)
+	if conv == "" || msg == "" {
+		return ""
+	}
+	return conv + "|" + msg
+}
+
+func (s *AppState) setLocalMessageReaction(conversationID, messageID, reaction string) {
+	key := reactionMessageKey(conversationID, messageID)
+	if key == "" {
+		return
+	}
+	s.messageReactionsMu.Lock()
+	if s.messageReactions == nil {
+		s.messageReactions = map[string]string{}
+	}
+	s.messageReactions[key] = strings.TrimSpace(strings.ToLower(reaction))
+	s.messageReactionsMu.Unlock()
+}
+
+func (s *AppState) getLocalMessageReaction(conversationID, messageID string) string {
+	key := reactionMessageKey(conversationID, messageID)
+	if key == "" {
+		return ""
+	}
+	s.messageReactionsMu.RLock()
+	reaction := s.messageReactions[key]
+	s.messageReactionsMu.RUnlock()
+	return reaction
+}
+
+func (s *AppState) formatMessageSecondary(message csa.ChatMessage, author string) string {
+	secondary := strings.TrimSpace(author)
+	parts := []string{}
+	for _, emotion := range message.Properties.Emotions {
+		name := strings.TrimSpace(emotion.Key)
+		if name == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s(%d)", name, len(emotion.Users)))
+	}
+	if local := s.getLocalMessageReaction(message.ConversationId, message.Id); local != "" {
+		parts = append(parts, "you:"+local)
+	}
+	if len(parts) > 0 {
+		return secondary + " | Reactions: " + strings.Join(parts, ", ")
+	}
+	return secondary
+}
+
+func (s *AppState) setPendingReply(reply *replyTarget) {
+	s.replyMu.Lock()
+	if reply == nil {
+		s.pendingReply = nil
+		s.replyMu.Unlock()
+		return
+	}
+	copied := *reply
+	s.pendingReply = &copied
+	s.replyMu.Unlock()
+}
+
+func (s *AppState) getPendingReply() *replyTarget {
+	s.replyMu.RLock()
+	defer s.replyMu.RUnlock()
+	if s.pendingReply == nil {
+		return nil
+	}
+	copied := *s.pendingReply
+	return &copied
+}
+
+func (s *AppState) clearPendingReply() {
+	s.replyMu.Lock()
+	s.pendingReply = nil
+	s.replyMu.Unlock()
 }
 
 func flattenConversationNodes(root *tview.TreeNode) []*tview.TreeNode {
@@ -1333,8 +1596,8 @@ func (s *AppState) loadConversations(c *csa.Channel) {
 	s.loadConversationsByIDs(nil, []string{c.Id}, c.DisplayName)
 }
 
-func (s *AppState) sendMessageAndRefresh(conversationIDs []string, displayName, content string, selectedNode *tview.TreeNode) {
-	err := s.sendMessage(conversationIDs, content)
+func (s *AppState) sendMessageAndRefresh(conversationIDs []string, displayName, content string, selectedNode *tview.TreeNode, reply *replyTarget) {
+	err := s.sendMessage(conversationIDs, content, reply)
 	if err != nil {
 		s.showError(err)
 		return
@@ -1348,23 +1611,35 @@ func (s *AppState) sendMessageAndRefresh(conversationIDs []string, displayName, 
 	}
 }
 
-func formatOutgoingHTML(content string) string {
+func formatOutgoingHTML(content string, reply *replyTarget) string {
 	lines := strings.Split(content, "\n")
 	for i := range lines {
 		lines[i] = strings.TrimSpace(lines[i])
 	}
 	body := strings.Join(lines, "<br/>")
+	if reply != nil {
+		author := strings.TrimSpace(reply.Author)
+		if author == "" {
+			author = "message"
+		}
+		preview := strings.TrimSpace(reply.Preview)
+		if preview == "" {
+			preview = "(message)"
+		}
+		quoted := "<blockquote><strong>Reply to " + author + ":</strong><br/>" + preview + "</blockquote>"
+		return quoted + "<div><div>" + body + "</div></div>"
+	}
 	return "<div><div>" + body + "</div></div>"
 }
 
-func (s *AppState) sendMessage(conversationIDs []string, content string) error {
+func (s *AppState) sendMessage(conversationIDs []string, content string, reply *replyTarget) error {
 	ids := normalizeConversationIDs(conversationIDs)
 	if len(ids) == 0 {
 		return fmt.Errorf("no conversation id available")
 	}
 
 	payload := map[string]interface{}{
-		"content":         formatOutgoingHTML(content),
+		"content":         formatOutgoingHTML(content, reply),
 		"messagetype":     "RichText/Html",
 		"contenttype":     "text",
 		"clientmessageid": strconv.FormatInt(time.Now().UnixNano(), 10),
@@ -1435,6 +1710,106 @@ func (s *AppState) sendMessage(conversationIDs []string, content string) error {
 
 	if lastErr == nil {
 		return fmt.Errorf("unable to send message")
+	}
+	return lastErr
+}
+
+func (s *AppState) reactToMessage(message csa.ChatMessage, reaction string) {
+	reaction = strings.TrimSpace(strings.ToLower(reaction))
+	if reaction == "" {
+		reaction = defaultReactionKey
+	}
+	conversationID := strings.TrimSpace(message.ConversationId)
+	messageID := strings.TrimSpace(message.Id)
+	if conversationID == "" || messageID == "" {
+		return
+	}
+
+	s.setLocalMessageReaction(conversationID, messageID, reaction)
+	if err := s.sendReaction(conversationID, messageID, reaction); err != nil {
+		s.logger.WithError(err).WithFields(logrus.Fields{
+			"conversation_id": conversationID,
+			"message_id":      messageID,
+			"reaction":        reaction,
+		}).Warn("unable to send reaction to server; keeping local reaction")
+	}
+
+	ids, title, node := s.getActiveConversation()
+	if len(ids) > 0 {
+		s.loadConversationsByIDs(node, ids, title)
+	}
+}
+
+func (s *AppState) sendReaction(conversationID, messageID, reaction string) error {
+	userMri := ""
+	if s.me != nil {
+		userMri = strings.TrimSpace(s.me.Mri)
+		if userMri == "" && strings.TrimSpace(s.me.ObjectId) != "" {
+			userMri = "8:orgid:" + strings.TrimSpace(s.me.ObjectId)
+		}
+	}
+	emotionsPayload := fmt.Sprintf(`[{"key":"%s","users":[{"mri":"%s","time":%d,"value":""}]}]`,
+		reaction, userMri, time.Now().UnixMilli())
+	bodyBytes, err := json.Marshal(map[string]interface{}{
+		"emotions": emotionsPayload,
+	})
+	if err != nil {
+		return fmt.Errorf("unable to encode reaction payload: %v", err)
+	}
+
+	endpoints := []string{
+		csa.MessagesHost + "v1/users/ME/conversations/" + url.QueryEscape(conversationID) + "/messages/" + url.QueryEscape(messageID) + "/properties",
+		csa.MessagesHost + "v1/users/ME/conversations/" + url.QueryEscape(conversationID) + "/messages/" + url.QueryEscape(messageID) + "/properties?name=emotions",
+	}
+	var lastErr error
+	for _, endpoint := range endpoints {
+		err = s.sendReactionRequest(endpoint, bodyBytes)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("reaction request failed")
+	}
+	return lastErr
+}
+
+func (s *AppState) sendReactionRequest(endpoint string, body []byte) error {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := s.teamsClient.ChatSvc().AuthenticatedRequest(http.MethodPut, endpoint, bytes.NewReader(body))
+		if err != nil {
+			if attempt == 0 && isUnauthorizedError(err) {
+				if refreshErr := s.refreshAuthFromTeamsToken(); refreshErr == nil {
+					continue
+				}
+			}
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			break
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusNoContent {
+			return nil
+		}
+		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
+			if refreshErr := s.refreshAuthFromTeamsToken(); refreshErr == nil {
+				continue
+			}
+		}
+		lastErr = fmt.Errorf("status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		break
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("reaction request failed")
 	}
 	return lastErr
 }
@@ -1563,6 +1938,7 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 	// Clear chat
 	chatList := s.components[ViChat].(*tview.List)
 	chatList.Clear()
+	s.setCurrentChatMessages(messages)
 	s.logger.WithFields(logrus.Fields{
 		"display_name":   displayName,
 		"messages_count": len(messages),
@@ -1572,7 +1948,7 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 		if author == "" {
 			author = inferMessageAuthor(message, s.me)
 		}
-		chatList.AddItem(textMessage(message.Content), author, 0, nil)
+		chatList.AddItem(textMessage(message.Content), s.formatMessageSecondary(message, author), 0, nil)
 	}
 	if chatList.GetItemCount() > 0 {
 		chatList.SetCurrentItem(chatList.GetItemCount() - 1)
@@ -1677,6 +2053,14 @@ func (s *AppState) loadEncryptedChatSettings() error {
 	}
 	s.chatTitlesMu.Unlock()
 
+	s.manualUnreadMu.Lock()
+	if settings.UnreadOverrides == nil {
+		s.manualUnread = map[string]bool{}
+	} else {
+		s.manualUnread = settings.UnreadOverrides
+	}
+	s.manualUnreadMu.Unlock()
+
 	return nil
 }
 
@@ -1691,8 +2075,9 @@ func (s *AppState) persistEncryptedChatSettings() {
 	}
 
 	settings := persistedChatSettings{
-		Favorites: map[string]bool{},
-		Titles:    map[string]string{},
+		Favorites:       map[string]bool{},
+		Titles:          map[string]string{},
+		UnreadOverrides: map[string]bool{},
 	}
 	s.chatFavoritesMu.RLock()
 	for k, v := range s.chatFavorites {
@@ -1706,6 +2091,11 @@ func (s *AppState) persistEncryptedChatSettings() {
 		}
 	}
 	s.chatTitlesMu.RUnlock()
+	s.manualUnreadMu.RLock()
+	for k, v := range s.manualUnread {
+		settings.UnreadOverrides[k] = v
+	}
+	s.manualUnreadMu.RUnlock()
 
 	plaintext, err := json.Marshal(settings)
 	if err != nil {
