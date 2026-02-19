@@ -1,94 +1,115 @@
 # teams-cli
 
-A Command Line Interface (or TUI) to interact with Microsoft Teams
-that uses the [teams-api](https://github.com/fossteams/teams-api)
-Go package.
+<p align="center">
+  <img src="./img/DarkMode_Color.svg" alt="teams-cli logo" width="200" />
+</p>
 
-## Status
+A terminal UI for Microsoft Teams powered by [teams-api](https://github.com/fossteams/teams-api).
 
-This project is actively evolving, and already supports daily messaging workflows
-for Teams channels and chats (including DMs) from a terminal UI.
+## Install
 
-## Requirements
+### Linux one-line install (from GitHub)
 
-- [Golang](https://golang.org/)
-- [Node.js](https://nodejs.org/) with `npm` (or `yarn`) for `teams-token` refresh flow
+Ubuntu / Debian:
 
-## Usage
+```bash
+sudo apt update && sudo apt install -y git curl golang-go nodejs npm && curl -fsSL https://raw.githubusercontent.com/Gamedirection/teams-cli/master/scripts/install.sh | sudo bash
+```
 
-Follow the instructions on how to obtain a token with [teams-token](https://github.com/fossteams/teams-token),
-then simply run the following to start the app. Binary releases will appear on this repository as soon as
-we have a product with more features.
+Fedora:
+
+```bash
+sudo dnf install -y git curl golang nodejs npm && curl -fsSL https://raw.githubusercontent.com/Gamedirection/teams-cli/master/scripts/install.sh | sudo bash
+```
+
+Arch / Manjaro:
+
+```bash
+sudo pacman -Sy --noconfirm git curl go nodejs npm && curl -fsSL https://raw.githubusercontent.com/Gamedirection/teams-cli/master/scripts/install.sh | sudo bash
+```
+
+openSUSE:
+
+```bash
+sudo zypper --non-interactive in git curl go nodejs npm && curl -fsSL https://raw.githubusercontent.com/Gamedirection/teams-cli/master/scripts/install.sh | sudo bash
+```
+
+Universal (dependencies preinstalled):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Gamedirection/teams-cli/master/scripts/install.sh | sudo bash
+```
+
+The installer:
+- clones/updates into `/opt/teams-cli`
+- installs `teams-cli` into `/usr/local/bin`
+- installs desktop icon from `img/DarkMode_Color.svg`
+- installs a `teams-cli.desktop` launcher
+
+## Run
+
+```bash
+teams-cli
+```
+
+## Development Run
 
 ```bash
 go run ./
 ```
 
-You can also use the included launcher command:
+## teams-token Integration
 
-```bash
-./teams-cli
-```
-
-To run it as `teams-cli` from anywhere, add this repo to your `PATH`:
-
-```bash
-export PATH="$PATH:/path/to/teams-cli"
-```
-
-This repo includes `teams-token` as a git submodule for auth auto-refresh on `401 Unauthorized` responses.
-After cloning `teams-cli`, initialize submodules:
+This repo includes `teams-token` as a git submodule for token refresh on `401 Unauthorized`.
 
 ```bash
 git submodule update --init --recursive
 ```
 
-When `teams-cli` hits a `401`, it will try to run `./teams-token` by auto-detecting the submodule runner:
-- local binary (`./teams-token/teams-token`), or
-- Go (`go run .`), or
-- Node (`yarn start` / `npm run start`, with install if needed).
+On `401`, teams-cli will try to run `teams-token` using:
+- local binary (`./teams-token/teams-token`)
+- Go (`go run .`)
+- Node (`yarn start` or `npm run start`, with install if needed)
 
-After auth refresh completes, the request is retried once.
+If a `401` still reaches the error page, a `Run teams-token` button appears for manual refresh.
 
-If a `401` still reaches the error page, a `Run teams-token` button is shown so you can manually trigger token refresh.
+## Features
 
-If everything goes well, you should see something like this:
-![Teams CLI example](./docs/screenshots/2021-04-13.png)
-<img width="1708" height="881" alt="image" src="https://github.com/user-attachments/assets/899b4aa5-f00e-4d6b-85b8-7dd9f3b07080" />
-
-
-## What works
-
-- Logging in into Teams using the token generated via `teams-token`
-- Getting the list of Teams + Channels
-- Reading channels
-- Reading chats/DMs (most recent chats are loaded first)
-- Sending messages in channels and chats/DMs
-- Tab/Shift+Tab to cycle focus between panes
-- Favorites for chats:
-  - Press `f` on a chat to add/remove it from `Chats > Favorites`
-  - Your personal `Private Notes` chat is detected and included in Favorites
-- Press `u` in the chat tree to refresh chat titles with better author/name resolution
-- Automatic auth retry after `401 Unauthorized` when optional `./teams-token` is present
-- Encrypted local persistence for:
-  - Favorite chats
-  - Updated chat titles
-  - Stored in `~/.config/fossteams/teams-cli-settings.enc` with key at `~/.config/fossteams/teams-cli-settings.key`
-
-## What doesn't work
-
-- Some Teams desktop features (calls/meetings/media-rich features) are still not implemented
+- Teams + channels listing
+- Channel read
+- DM/chat read (recent first)
+- Send messages in channels and chats
+- Chat favorites (`f`)
+- Private Notes chat auto-detected and grouped into Favorites
+- Chat title refresh (`u`)
+- Encrypted persistence of:
+  - favorites
+  - updated chat titles
+- Encrypted settings files:
+  - `~/.config/fossteams/teams-cli-settings.enc`
+  - `~/.config/fossteams/teams-cli-settings.key`
 
 ## Keybindings
 
-- `Tab`: focus next pane
-- `Shift+Tab`: focus previous pane
-- `i`: focus compose input for the selected conversation
-- `Enter` (in compose): send message
-- `Esc` (in compose): return focus to tree
-- `f`: toggle favorite for selected chat
-- `u`: refresh chat names/titles
+- `Tab`: next pane
+- `Shift+Tab`: previous pane
+- `i`: focus compose input
+- `Enter` (compose): send message
+- `Esc` (compose): back to tree
+- `f`: toggle favorite chat
+- `u`: refresh chat titles
 
-## You might also be interested in
+## Packaging Roadmap
 
-- [fossteams-frontend](https://github.com/fossteams/fossteams-frontend): a Vue based frontend for Microsoft Teams
+Planned distribution formats:
+- `apt`
+- `dnf`
+- `pacman`
+- Homebrew
+- Chocolatey
+- AppImage
+- Flatpak
+
+## Related
+
+- [fossteams-frontend](https://github.com/fossteams/fossteams-frontend)
