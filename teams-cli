@@ -9,4 +9,5 @@ SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 CACHE_DIR="$SCRIPT_DIR/.cache/go-build"
 mkdir -p "$CACHE_DIR"
 
-exec env GOCACHE="$CACHE_DIR" go run "$SCRIPT_DIR"/. "$@"
+cd "$SCRIPT_DIR"
+exec env GOCACHE="$CACHE_DIR" go run . "$@"

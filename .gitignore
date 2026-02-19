@@ -4,3 +4,4 @@
 *.enc
 .cache/go-build/*
 ./.cache
+.cache/
