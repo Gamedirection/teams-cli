@@ -86,6 +86,10 @@ type AppState struct {
 	settingsMode          bool
 	settingsSelection     int
 	settingsCaptureAction string
+
+	mentionCycleMu    sync.Mutex
+	mentionCycleToken string
+	mentionCycleIndex int
 }
 
 type conversationRef struct {
@@ -859,8 +863,46 @@ func (s *AppState) fillMainWindow() {
 		}
 		return event
 	})
+	composeView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event == nil {
+			return event
+		}
+		if event.Key() != tcell.KeyUp && event.Key() != tcell.KeyDown {
+			return event
+		}
+		text := composeView.GetText()
+		start, prefix, query, ok := extractTrailingMentionQuery(text)
+		if !ok {
+			s.resetMentionCycle()
+			return event
+		}
+		ids, _, _ := s.getActiveConversation()
+		suggestions := s.findMentionSuggestions(prefix, query, ids)
+		if len(suggestions) == 0 {
+			s.resetMentionCycle()
+			return event
+		}
+
+		tokenKey := strings.ToLower(prefix + ":" + query)
+		nextIdx := s.nextMentionCycleIndex(tokenKey, len(suggestions), event.Key() == tcell.KeyUp)
+		if nextIdx < 0 || nextIdx >= len(suggestions) {
+			return event
+		}
+		selected := suggestions[nextIdx]
+		if strings.TrimSpace(selected.DisplayName) == "" {
+			return event
+		}
+		replacement := prefix + mentionTokenFromDisplayName(selected.DisplayName)
+		if strings.TrimSpace(replacement) == strings.TrimSpace(prefix) {
+			return event
+		}
+		composeView.SetText(text[:start] + replacement)
+		composeView.SetTitle(s.composeTitleWithScanStatus() + " | Mention: " + selected.DisplayName)
+		return nil
+	})
 	composeView.SetDoneFunc(func(key tcell.Key) {
 		if key == tcell.KeyEscape {
+			s.resetMentionCycle()
 			s.clearPendingReply()
 			s.updateComposeReplyUI()
 			s.app.SetFocus(treeView)
@@ -880,6 +922,7 @@ func (s *AppState) fillMainWindow() {
 		}
 		reply := s.getPendingReply()
 		s.clearPendingReply()
+		s.resetMentionCycle()
 		s.updateComposeReplyUI()
 		composeView.SetText("")
 		go s.sendMessageAndRefresh(ids, title, messageText, selectedNode, reply)
@@ -2334,6 +2377,119 @@ func normalizeConversationIDs(conversationIDs []string) []string {
 	return ids
 }
 
+func extractTrailingMentionQuery(text string) (start int, prefix string, query string, ok bool) {
+	if strings.TrimSpace(text) == "" {
+		return 0, "", "", false
+	}
+	end := len(text)
+	i := end - 1
+	for i >= 0 {
+		ch := text[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-' {
+			i--
+			continue
+		}
+		break
+	}
+	tokenStart := i + 1
+	if tokenStart <= 0 {
+		return 0, "", "", false
+	}
+	if tokenStart >= len(text) {
+		return 0, "", "", false
+	}
+	if text[tokenStart-1] == '@' {
+		if tokenStart-2 >= 0 && (text[tokenStart-2] == 'c' || text[tokenStart-2] == 'C') {
+			return tokenStart - 2, "c@", text[tokenStart:end], true
+		}
+		return tokenStart - 1, "@", text[tokenStart:end], true
+	}
+	return 0, "", "", false
+}
+
+func mentionTokenFromDisplayName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func normalizeMentionSearch(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func (s *AppState) findMentionSuggestions(prefix, query string, conversationIDs []string) []mentionCandidate {
+	var base []mentionCandidate
+	if strings.EqualFold(prefix, "c@") {
+		base = s.mentionCandidatesGlobal()
+	} else {
+		base = append([]mentionCandidate{}, s.mentionCandidatesForConversation(conversationIDs)...)
+		base = append(base, s.mentionCandidatesGlobal()...)
+		base = uniqueMentions(base)
+	}
+	queryNorm := normalizeMentionSearch(query)
+	if queryNorm == "" {
+		return base
+	}
+	starts := []mentionCandidate{}
+	contains := []mentionCandidate{}
+	for _, c := range base {
+		nameNorm := normalizeMentionSearch(c.DisplayName)
+		if strings.HasPrefix(nameNorm, queryNorm) {
+			starts = append(starts, c)
+		} else if strings.Contains(nameNorm, queryNorm) {
+			contains = append(contains, c)
+		}
+	}
+	return append(starts, contains...)
+}
+
+func (s *AppState) resetMentionCycle() {
+	s.mentionCycleMu.Lock()
+	s.mentionCycleToken = ""
+	s.mentionCycleIndex = -1
+	s.mentionCycleMu.Unlock()
+}
+
+func (s *AppState) nextMentionCycleIndex(token string, count int, backwards bool) int {
+	if count <= 0 {
+		return -1
+	}
+	s.mentionCycleMu.Lock()
+	defer s.mentionCycleMu.Unlock()
+	if s.mentionCycleToken != token {
+		s.mentionCycleToken = token
+		s.mentionCycleIndex = -1
+	}
+	if backwards {
+		if s.mentionCycleIndex <= 0 {
+			s.mentionCycleIndex = count - 1
+		} else {
+			s.mentionCycleIndex--
+		}
+	} else {
+		s.mentionCycleIndex = (s.mentionCycleIndex + 1) % count
+	}
+	return s.mentionCycleIndex
+}
+
 func (s *AppState) applyMentions(content string, conversationIDs []string) (string, []mentionWire) {
 	if strings.TrimSpace(content) == "" {
 		return content, nil
@@ -2401,18 +2557,18 @@ func (s *AppState) applyMentions(content string, conversationIDs []string) (stri
 }
 
 func findMentionCandidate(query string, candidates []mentionCandidate) (mentionCandidate, bool) {
-	query = strings.ToLower(strings.TrimSpace(query))
+	query = normalizeMentionSearch(query)
 	if query == "" {
 		return mentionCandidate{}, false
 	}
 	for _, c := range candidates {
-		name := strings.ToLower(strings.TrimSpace(c.DisplayName))
+		name := normalizeMentionSearch(c.DisplayName)
 		if strings.HasPrefix(name, query) {
 			return c, true
 		}
 	}
 	for _, c := range candidates {
-		name := strings.ToLower(strings.TrimSpace(c.DisplayName))
+		name := normalizeMentionSearch(c.DisplayName)
 		if strings.Contains(name, query) {
 			return c, true
 		}
