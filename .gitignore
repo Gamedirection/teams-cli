@@ -2,3 +2,4 @@
 *.log
 *.key
 *.enc
+.cache/go-build/*
