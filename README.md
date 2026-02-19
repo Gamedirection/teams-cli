@@ -12,6 +12,7 @@ for Teams channels and chats (including DMs) from a terminal UI.
 ## Requirements
 
 - [Golang](https://golang.org/)
+- [Node.js](https://nodejs.org/) with `npm` (or `yarn`) for `teams-token` refresh flow
 
 ## Usage
 
@@ -23,6 +24,18 @@ we have a product with more features.
 go run ./
 ```
 
+You can also use the included launcher command:
+
+```bash
+./teams-cli
+```
+
+To run it as `teams-cli` from anywhere, add this repo to your `PATH`:
+
+```bash
+export PATH="$PATH:/path/to/teams-cli"
+```
+
 This repo includes `teams-token` as a git submodule for auth auto-refresh on `401 Unauthorized` responses.
 After cloning `teams-cli`, initialize submodules:
 
@@ -30,8 +43,14 @@ After cloning `teams-cli`, initialize submodules:
 git submodule update --init --recursive
 ```
 
-When `teams-cli` hits a `401`, it will try to run `./teams-token` (or `go run .` inside `./teams-token`)
-to refresh tokens, then retry the request once.
+When `teams-cli` hits a `401`, it will try to run `./teams-token` by auto-detecting the submodule runner:
+- local binary (`./teams-token/teams-token`), or
+- Go (`go run .`), or
+- Node (`yarn start` / `npm run start`, with install if needed).
+
+After auth refresh completes, the request is retried once.
+
+If a `401` still reaches the error page, a `Run teams-token` button is shown so you can manually trigger token refresh.
 
 If everything goes well, you should see something like this:
 ![Teams CLI example](./docs/screenshots/2021-04-13.png)
@@ -51,6 +70,10 @@ If everything goes well, you should see something like this:
   - Your personal `Private Notes` chat is detected and included in Favorites
 - Press `u` in the chat tree to refresh chat titles with better author/name resolution
 - Automatic auth retry after `401 Unauthorized` when optional `./teams-token` is present
+- Encrypted local persistence for:
+  - Favorite chats
+  - Updated chat titles
+  - Stored in `~/.config/fossteams/teams-cli-settings.enc` with key at `~/.config/fossteams/teams-cli-settings.key`
 
 ## What doesn't work
 

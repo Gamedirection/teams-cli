@@ -2,6 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"github.com/dgrijalva/jwt-go"
@@ -42,8 +46,13 @@ type AppState struct {
 
 	chatFavoritesMu sync.RWMutex
 	chatFavorites   map[string]bool
+	chatTitlesMu    sync.RWMutex
+	chatTitles      map[string]string
 
 	authRefreshMu sync.Mutex
+
+	settingsPath string
+	settingsKey  string
 }
 
 type conversationRef struct {
@@ -53,11 +62,27 @@ type conversationRef struct {
 	isFavorite bool
 }
 
+type encryptedSettingsFile struct {
+	Version    int    `json:"version"`
+	Nonce      string `json:"nonce"`
+	Ciphertext string `json:"ciphertext"`
+}
+
+type persistedChatSettings struct {
+	Favorites map[string]bool   `json:"favorites"`
+	Titles    map[string]string `json:"titles"`
+}
+
 func (s *AppState) createApp() {
 	s.logger.Debug("creating application pages and components")
 	s.pages = tview.NewPages()
 	s.components = map[string]tview.Primitive{}
 	s.chatFavorites = map[string]bool{}
+	s.chatTitles = map[string]string{}
+	s.settingsPath, s.settingsKey = defaultSettingsPaths()
+	if err := s.loadEncryptedChatSettings(); err != nil {
+		s.logger.WithError(err).Warn("unable to load encrypted chat settings")
+	}
 
 	// Add pages
 	s.pages.AddPage(PageLogin, s.createLoginPage(), true, false)
@@ -283,7 +308,23 @@ func (s *AppState) showError(err error) {
 		return
 	}
 	val.(*tview.TextView).SetText(err.Error())
+
+	is401 := isUnauthorizedError(err)
+	if body, ok := s.components[FlErrorBody].(*tview.Flex); ok {
+		if action, ok := s.components[FlErrorAction]; ok {
+			if is401 {
+				body.ResizeItem(action, 3, 0)
+			} else {
+				body.ResizeItem(action, 0, 0)
+			}
+		}
+	}
 	s.pages.SwitchToPage(PageError)
+	if is401 {
+		if btn, ok := s.components[BtErrorAuth].(*tview.Button); ok {
+			s.app.SetFocus(btn)
+		}
+	}
 	s.app.Draw()
 }
 
@@ -296,14 +337,45 @@ func (s *AppState) createErrorView() tview.Primitive {
 	p.SetBorder(true)
 	p.SetBorderPadding(1, 1, 1, 1)
 
+	authButton := tview.NewButton("Run teams-token")
+	authButton.SetSelectedFunc(func() {
+		go func() {
+			s.app.QueueUpdateDraw(func() {
+				p.SetText("Refreshing auth by running ./teams-token ...")
+			})
+			err := s.refreshAuthFromTeamsToken()
+			s.app.QueueUpdateDraw(func() {
+				if err != nil {
+					p.SetText(fmt.Sprintf("Unable to refresh auth: %v", err))
+					return
+				}
+				p.SetText("Auth refresh succeeded. Returning to main view.")
+				s.pages.SwitchToPage(PageMain)
+				if tree, ok := s.components[TrChat]; ok {
+					s.app.SetFocus(tree)
+				}
+			})
+		}()
+	})
+	actionRow := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(authButton, 24, 0, true).
+		AddItem(nil, 0, 1, false)
+
+	body := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(nil, 0, 1, false).
+		AddItem(p, 10, 1, false).
+		AddItem(actionRow, 0, 0, false).
+		AddItem(nil, 0, 1, false)
+
 	s.components[TvError] = p
+	s.components[BtErrorAuth] = authButton
+	s.components[FlErrorBody] = body
+	s.components[FlErrorAction] = actionRow
 
 	return tview.NewFlex().
 		AddItem(nil, 0, 1, false).
-		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(nil, 0, 1, false).
-			AddItem(p, 10, 1, false).
-			AddItem(nil, 0, 1, false), 60, 1, false).
+		AddItem(body, 60, 1, false).
 		AddItem(nil, 0, 1, false)
 }
 
@@ -361,6 +433,8 @@ func (s *AppState) fillMainWindow() {
 		}
 		chatName := buildChatDisplayName(chat, s.me)
 		candidateIDs := candidateConversationIds(chat, s.conversations.PrivateFeeds)
+		chatKey := chatFavoriteKey(chat.Id, candidateIDs)
+		chatName = s.chatDisplayNameForKey(chatKey, chatName)
 		s.logger.WithFields(logrus.Fields{
 			"chat_title":      chatName,
 			"chat_id":         chat.Id,
@@ -372,7 +446,6 @@ func (s *AppState) fillMainWindow() {
 		}).Debug("prepared chat node")
 		chatNode := tview.NewTreeNode(chatName)
 		chatNode.SetColor(tcell.ColorGreen)
-		chatKey := chatFavoriteKey(chat.Id, candidateIDs)
 		isFavorite := s.chatIsFavorite(chat, chatKey)
 		chatNode.SetReference(conversationRef{
 			ids:        candidateIDs,
@@ -580,6 +653,20 @@ func (s *AppState) chatIsFavorite(chat csa.Chat, chatKey string) bool {
 	return isPrivateNotesChat(chat)
 }
 
+func (s *AppState) chatDisplayNameForKey(chatKey, fallback string) string {
+	key := normalizeFavoriteKey(chatKey)
+	if key == "" {
+		return fallback
+	}
+	s.chatTitlesMu.RLock()
+	title := strings.TrimSpace(s.chatTitles[key])
+	s.chatTitlesMu.RUnlock()
+	if title == "" {
+		return fallback
+	}
+	return title
+}
+
 func (s *AppState) toggleChatFavorite(chatKey string, current bool) bool {
 	key := normalizeFavoriteKey(chatKey)
 	if key == "" {
@@ -592,7 +679,31 @@ func (s *AppState) toggleChatFavorite(chatKey string, current bool) bool {
 	}
 	s.chatFavorites[key] = next
 	s.chatFavoritesMu.Unlock()
+	s.persistEncryptedChatSettings()
 	return next
+}
+
+func (s *AppState) setChatTitle(chatKey, title string) bool {
+	key := normalizeFavoriteKey(chatKey)
+	if key == "" {
+		return false
+	}
+	trimmed := strings.TrimSpace(title)
+	if trimmed == "" {
+		return false
+	}
+
+	s.chatTitlesMu.Lock()
+	if s.chatTitles == nil {
+		s.chatTitles = map[string]string{}
+	}
+	if s.chatTitles[key] == trimmed {
+		s.chatTitlesMu.Unlock()
+		return false
+	}
+	s.chatTitles[key] = trimmed
+	s.chatTitlesMu.Unlock()
+	return true
 }
 
 func (s *AppState) toggleFavoriteForCurrentNode(treeView *tview.TreeView, chatsNode, favoritesNode, recentNode *tview.TreeNode) (handled bool) {
@@ -762,6 +873,7 @@ func (s *AppState) refreshAllChatLabels(chatsNode *tview.TreeNode) {
 	nodes := flattenConversationNodes(chatsNode)
 	updated := 0
 	attempted := 0
+	titlesChanged := false
 	for _, node := range nodes {
 		ref, ok := node.GetReference().(conversationRef)
 		if !ok {
@@ -784,10 +896,16 @@ func (s *AppState) refreshAllChatLabels(chatsNode *tview.TreeNode) {
 
 		ref.title = title
 		updated++
+		if s.setChatTitle(ref.chatKey, title) {
+			titlesChanged = true
+		}
 		s.app.QueueUpdateDraw(func() {
 			node.SetText(title)
 			node.SetReference(ref)
 		})
+	}
+	if titlesChanged {
+		s.persistEncryptedChatSettings()
 	}
 
 	s.logger.WithFields(logrus.Fields{
@@ -1165,6 +1283,9 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 		if ref, ok := selectedNode.GetReference().(conversationRef); ok {
 			ref.title = displayName
 			selectedNode.SetReference(ref)
+			if s.setChatTitle(ref.chatKey, displayName) {
+				s.persistEncryptedChatSettings()
+			}
 		}
 	}
 	s.components[ViChat].(*tview.List).
@@ -1213,6 +1334,187 @@ func inferMessageAuthor(message csa.ChatMessage, me *models.User) string {
 	return "Unknown"
 }
 
+func defaultSettingsPaths() (string, string) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(homeDir) == "" {
+		return "teams-cli-settings.enc", "teams-cli-settings.key"
+	}
+	configDir := filepath.Join(homeDir, ".config", "fossteams")
+	return filepath.Join(configDir, "teams-cli-settings.enc"), filepath.Join(configDir, "teams-cli-settings.key")
+}
+
+func (s *AppState) loadEncryptedChatSettings() error {
+	if strings.TrimSpace(s.settingsPath) == "" || strings.TrimSpace(s.settingsKey) == "" {
+		return nil
+	}
+	data, err := os.ReadFile(s.settingsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	var stored encryptedSettingsFile
+	if err = json.Unmarshal(data, &stored); err != nil {
+		return fmt.Errorf("invalid settings file format: %v", err)
+	}
+	if stored.Version != 1 {
+		return fmt.Errorf("unsupported settings file version: %d", stored.Version)
+	}
+
+	key, err := s.readOrCreateSettingsKey()
+	if err != nil {
+		return err
+	}
+	nonce, err := base64.StdEncoding.DecodeString(stored.Nonce)
+	if err != nil {
+		return fmt.Errorf("invalid settings nonce: %v", err)
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(stored.Ciphertext)
+	if err != nil {
+		return fmt.Errorf("invalid settings ciphertext: %v", err)
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return fmt.Errorf("unable to decrypt settings: %v", err)
+	}
+
+	var settings persistedChatSettings
+	if err = json.Unmarshal(plaintext, &settings); err != nil {
+		return fmt.Errorf("invalid decrypted settings payload: %v", err)
+	}
+
+	s.chatFavoritesMu.Lock()
+	if settings.Favorites == nil {
+		s.chatFavorites = map[string]bool{}
+	} else {
+		s.chatFavorites = settings.Favorites
+	}
+	s.chatFavoritesMu.Unlock()
+
+	s.chatTitlesMu.Lock()
+	if settings.Titles == nil {
+		s.chatTitles = map[string]string{}
+	} else {
+		s.chatTitles = settings.Titles
+	}
+	s.chatTitlesMu.Unlock()
+
+	return nil
+}
+
+func (s *AppState) persistEncryptedChatSettings() {
+	if strings.TrimSpace(s.settingsPath) == "" || strings.TrimSpace(s.settingsKey) == "" {
+		return
+	}
+	key, err := s.readOrCreateSettingsKey()
+	if err != nil {
+		s.logger.WithError(err).Warn("unable to load settings encryption key")
+		return
+	}
+
+	settings := persistedChatSettings{
+		Favorites: map[string]bool{},
+		Titles:    map[string]string{},
+	}
+	s.chatFavoritesMu.RLock()
+	for k, v := range s.chatFavorites {
+		settings.Favorites[k] = v
+	}
+	s.chatFavoritesMu.RUnlock()
+	s.chatTitlesMu.RLock()
+	for k, v := range s.chatTitles {
+		if strings.TrimSpace(v) != "" {
+			settings.Titles[k] = strings.TrimSpace(v)
+		}
+	}
+	s.chatTitlesMu.RUnlock()
+
+	plaintext, err := json.Marshal(settings)
+	if err != nil {
+		s.logger.WithError(err).Warn("unable to encode chat settings")
+		return
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		s.logger.WithError(err).Warn("unable to initialize encryption cipher")
+		return
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		s.logger.WithError(err).Warn("unable to initialize encryption mode")
+		return
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		s.logger.WithError(err).Warn("unable to create encryption nonce")
+		return
+	}
+	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
+
+	encoded, err := json.Marshal(encryptedSettingsFile{
+		Version:    1,
+		Nonce:      base64.StdEncoding.EncodeToString(nonce),
+		Ciphertext: base64.StdEncoding.EncodeToString(ciphertext),
+	})
+	if err != nil {
+		s.logger.WithError(err).Warn("unable to encode encrypted settings payload")
+		return
+	}
+
+	if err = os.MkdirAll(filepath.Dir(s.settingsPath), 0o700); err != nil {
+		s.logger.WithError(err).Warn("unable to create settings directory")
+		return
+	}
+	tmpPath := s.settingsPath + ".tmp"
+	if err = os.WriteFile(tmpPath, encoded, 0o600); err != nil {
+		s.logger.WithError(err).Warn("unable to write temporary settings file")
+		return
+	}
+	if err = os.Rename(tmpPath, s.settingsPath); err != nil {
+		s.logger.WithError(err).Warn("unable to finalize encrypted settings file")
+	}
+}
+
+func (s *AppState) readOrCreateSettingsKey() ([]byte, error) {
+	if strings.TrimSpace(s.settingsKey) == "" {
+		return nil, fmt.Errorf("settings key path is not configured")
+	}
+	key, err := os.ReadFile(s.settingsKey)
+	if err == nil {
+		if len(key) != 32 {
+			return nil, fmt.Errorf("invalid settings key length")
+		}
+		return key, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	key = make([]byte, 32)
+	if _, err = rand.Read(key); err != nil {
+		return nil, err
+	}
+	if err = os.MkdirAll(filepath.Dir(s.settingsKey), 0o700); err != nil {
+		return nil, err
+	}
+	if err = os.WriteFile(s.settingsKey, key, 0o600); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
 func isUnauthorizedError(err error) bool {
 	if err == nil {
 		return false
@@ -1237,11 +1539,38 @@ func (s *AppState) refreshAuthFromTeamsToken() error {
 		cmd = exec.Command("./teams-token")
 		cmd.Dir = teamsTokenDir
 	} else {
-		if _, statErr = os.Stat(filepath.Join(teamsTokenDir, "go.mod")); statErr != nil {
-			return fmt.Errorf("%s exists but has no teams-token binary or go.mod", teamsTokenDir)
+		if _, statErr = os.Stat(filepath.Join(teamsTokenDir, "go.mod")); statErr == nil {
+			cmd = exec.Command("go", "run", ".")
+			cmd.Dir = teamsTokenDir
+		} else if _, statErr = os.Stat(filepath.Join(teamsTokenDir, "package.json")); statErr == nil {
+			if hasYarnLock := fileExists(filepath.Join(teamsTokenDir, "yarn.lock")); hasYarnLock && commandExists("yarn") {
+				if !fileExists(filepath.Join(teamsTokenDir, "node_modules")) {
+					installCmd := exec.Command("yarn", "install")
+					installCmd.Dir = teamsTokenDir
+					installOutput, installErr := installCmd.CombinedOutput()
+					if installErr != nil {
+						return fmt.Errorf("teams-token yarn install failed: %v (output: %s)", installErr, strings.TrimSpace(string(installOutput)))
+					}
+				}
+				cmd = exec.Command("yarn", "start")
+				cmd.Dir = teamsTokenDir
+			} else if commandExists("npm") {
+				if !fileExists(filepath.Join(teamsTokenDir, "node_modules")) {
+					installCmd := exec.Command("npm", "install", "--no-audit", "--no-fund")
+					installCmd.Dir = teamsTokenDir
+					installOutput, installErr := installCmd.CombinedOutput()
+					if installErr != nil {
+						return fmt.Errorf("teams-token npm install failed: %v (output: %s)", installErr, strings.TrimSpace(string(installOutput)))
+					}
+				}
+				cmd = exec.Command("npm", "run", "start")
+				cmd.Dir = teamsTokenDir
+			} else {
+				return fmt.Errorf("%s is a Node project, but neither yarn nor npm is installed", teamsTokenDir)
+			}
+		} else {
+			return fmt.Errorf("%s exists but has no supported runner (binary/go.mod/package.json)", teamsTokenDir)
 		}
-		cmd = exec.Command("go", "run", ".")
-		cmd.Dir = teamsTokenDir
 	}
 
 	output, runErr := cmd.CombinedOutput()
@@ -1256,4 +1585,14 @@ func (s *AppState) refreshAuthFromTeamsToken() error {
 	}
 	s.teamsClient = newClient
 	return nil
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info != nil
+}
+
+func commandExists(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
 }
