@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -101,6 +102,20 @@ type replyTarget struct {
 	Preview   string
 }
 
+type mentionCandidate struct {
+	DisplayName string
+	Mri         string
+	ObjectID    string
+}
+
+type mentionWire struct {
+	ID          int    `json:"id"`
+	MentionType string `json:"mentionType"`
+	Mri         string `json:"mri,omitempty"`
+	DisplayName string `json:"displayName"`
+	ObjectId    string `json:"objectId,omitempty"`
+}
+
 type encryptedSettingsFile struct {
 	Version    int    `json:"version"`
 	Nonce      string `json:"nonce"`
@@ -127,6 +142,8 @@ const composeDefaultPlaceholder = "Press i to compose, f to toggle favorite chat
 const settingsHelpChatKey = "__settings_help__"
 const defaultReactionKey = "like"
 const defaultKeybindPreset = "default"
+
+var mentionTokenRegex = regexp.MustCompile(`(?m)(^|[\s])([cC]?@)([A-Za-z0-9._-]+)`)
 
 const (
 	settingsItemInfo    = "info"
@@ -2006,14 +2023,22 @@ func (s *AppState) sendMessage(conversationIDs []string, content string, reply *
 	if len(ids) == 0 {
 		return fmt.Errorf("no conversation id available")
 	}
+	mentionContent, mentions := s.applyMentions(content, ids)
+	properties := map[string]interface{}{}
+	if len(mentions) > 0 {
+		mentionsJSON, err := json.Marshal(mentions)
+		if err == nil {
+			properties["mentions"] = string(mentionsJSON)
+		}
+	}
 
 	payload := map[string]interface{}{
-		"content":         formatOutgoingHTML(content, reply),
+		"content":         formatOutgoingHTML(mentionContent, reply),
 		"messagetype":     "RichText/Html",
 		"contenttype":     "text",
 		"clientmessageid": strconv.FormatInt(time.Now().UnixNano(), 10),
 		"amsreferences":   []string{},
-		"properties":      map[string]interface{}{},
+		"properties":      properties,
 	}
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -2307,6 +2332,188 @@ func normalizeConversationIDs(conversationIDs []string) []string {
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+func (s *AppState) applyMentions(content string, conversationIDs []string) (string, []mentionWire) {
+	if strings.TrimSpace(content) == "" {
+		return content, nil
+	}
+	conversationCandidates := s.mentionCandidatesForConversation(conversationIDs)
+	globalCandidates := s.mentionCandidatesGlobal()
+	mentions := []mentionWire{}
+	seenKeyToID := map[string]int{}
+
+	out := mentionTokenRegex.ReplaceAllStringFunc(content, func(match string) string {
+		prefixWhitespace := ""
+		if len(match) > 0 {
+			first := match[0]
+			if first == ' ' || first == '\t' || first == '\n' {
+				prefixWhitespace = string(first)
+				match = match[1:]
+			}
+		}
+		atPrefix := "@"
+		query := ""
+		if strings.HasPrefix(strings.ToLower(match), "c@") {
+			atPrefix = "c@"
+			query = match[2:]
+		} else if strings.HasPrefix(match, "@") {
+			atPrefix = "@"
+			query = match[1:]
+		} else {
+			return prefixWhitespace + match
+		}
+		if strings.TrimSpace(query) == "" {
+			return prefixWhitespace + match
+		}
+
+		var candidate mentionCandidate
+		var ok bool
+		if atPrefix == "@" {
+			candidate, ok = findMentionCandidate(query, conversationCandidates)
+			if !ok {
+				candidate, ok = findMentionCandidate(query, globalCandidates)
+			}
+		} else {
+			candidate, ok = findMentionCandidate(query, globalCandidates)
+		}
+		if !ok || strings.TrimSpace(candidate.DisplayName) == "" {
+			return prefixWhitespace + match
+		}
+
+		key := strings.ToLower(strings.TrimSpace(candidate.DisplayName)) + "|" + strings.ToLower(strings.TrimSpace(candidate.Mri))
+		mentionID, exists := seenKeyToID[key]
+		if !exists {
+			mentionID = len(mentions)
+			seenKeyToID[key] = mentionID
+			mentions = append(mentions, mentionWire{
+				ID:          mentionID,
+				MentionType: "person",
+				Mri:         strings.TrimSpace(candidate.Mri),
+				DisplayName: strings.TrimSpace(candidate.DisplayName),
+				ObjectId:    strings.TrimSpace(candidate.ObjectID),
+			})
+		}
+		return prefixWhitespace + fmt.Sprintf("<at id=\"%d\">%s</at>", mentionID, candidate.DisplayName)
+	})
+
+	return out, mentions
+}
+
+func findMentionCandidate(query string, candidates []mentionCandidate) (mentionCandidate, bool) {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return mentionCandidate{}, false
+	}
+	for _, c := range candidates {
+		name := strings.ToLower(strings.TrimSpace(c.DisplayName))
+		if strings.HasPrefix(name, query) {
+			return c, true
+		}
+	}
+	for _, c := range candidates {
+		name := strings.ToLower(strings.TrimSpace(c.DisplayName))
+		if strings.Contains(name, query) {
+			return c, true
+		}
+	}
+	return mentionCandidate{}, false
+}
+
+func mentionKey(c mentionCandidate) string {
+	name := strings.ToLower(strings.TrimSpace(c.DisplayName))
+	mri := strings.ToLower(strings.TrimSpace(c.Mri))
+	obj := strings.ToLower(strings.TrimSpace(c.ObjectID))
+	if name == "" {
+		return ""
+	}
+	return name + "|" + mri + "|" + obj
+}
+
+func uniqueMentions(in []mentionCandidate) []mentionCandidate {
+	out := make([]mentionCandidate, 0, len(in))
+	seen := map[string]struct{}{}
+	for _, c := range in {
+		if strings.TrimSpace(c.DisplayName) == "" {
+			continue
+		}
+		key := mentionKey(c)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i].DisplayName) < strings.ToLower(out[j].DisplayName)
+	})
+	return out
+}
+
+func (s *AppState) mentionCandidatesForConversation(conversationIDs []string) []mentionCandidate {
+	if s.conversations == nil {
+		return nil
+	}
+	ids := map[string]struct{}{}
+	for _, id := range conversationIDs {
+		n := normalizeFavoriteKey(id)
+		if n != "" {
+			ids[n] = struct{}{}
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	candidates := []mentionCandidate{}
+	for _, chat := range s.conversations.Chats {
+		chatID := normalizeFavoriteKey(chat.Id)
+		if _, ok := ids[chatID]; !ok {
+			continue
+		}
+		for _, member := range chat.Members {
+			if isCurrentUser(member, s.me) {
+				continue
+			}
+			name := strings.TrimSpace(member.FriendlyName)
+			if isSelfDisplayName(name, s.me) {
+				continue
+			}
+			candidates = append(candidates, mentionCandidate{
+				DisplayName: name,
+				Mri:         strings.TrimSpace(member.Mri),
+				ObjectID:    strings.TrimSpace(member.ObjectId),
+			})
+		}
+	}
+	return uniqueMentions(candidates)
+}
+
+func (s *AppState) mentionCandidatesGlobal() []mentionCandidate {
+	if s.conversations == nil {
+		return nil
+	}
+	candidates := []mentionCandidate{}
+	for _, chat := range s.conversations.Chats {
+		for _, member := range chat.Members {
+			if isCurrentUser(member, s.me) {
+				continue
+			}
+			name := strings.TrimSpace(member.FriendlyName)
+			if isSelfDisplayName(name, s.me) {
+				continue
+			}
+			candidates = append(candidates, mentionCandidate{
+				DisplayName: name,
+				Mri:         strings.TrimSpace(member.Mri),
+				ObjectID:    strings.TrimSpace(member.ObjectId),
+			})
+		}
+	}
+	return uniqueMentions(candidates)
 }
 
 func (s *AppState) fetchConversationMessages(displayName string, conversationIDs []string) ([]string, []csa.ChatMessage, error) {
