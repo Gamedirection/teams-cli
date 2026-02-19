@@ -34,7 +34,7 @@ fi
 git -C "${INSTALL_DIR}" submodule update --init --recursive
 
 install -d "${BIN_DIR}" "${ICON_DIR}" "${DESKTOP_DIR}"
-install -m 0755 "${INSTALL_DIR}/teams-cli" "${BIN_DIR}/teams-cli"
+ln -sf "${INSTALL_DIR}/teams-cli" "${BIN_DIR}/teams-cli"
 install -m 0644 "${INSTALL_DIR}/img/DarkMode_Color.svg" "${ICON_DIR}/teams-cli.svg"
 
 cat > "${DESKTOP_DIR}/teams-cli.desktop" <<'EOF'
