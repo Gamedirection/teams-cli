@@ -82,6 +82,9 @@ If a `401` still reaches the error page, a `Run teams-token` button appears for 
 - Chat favorites (`f`)
 - Private Notes chat auto-detected and grouped into Favorites
 - Chat title refresh (`u`)
+- Unread marker auto-refresh every minute (toggle with `m`, manual scan with `Shift+M`)
+- Compose title shows scanner status (`ON/OFF`), scan progress, and last scan result
+- Manual mark unread hotkey (`r`) for selected chat
 - Encrypted persistence of:
   - favorites
   - updated chat titles
@@ -96,8 +99,20 @@ If a `401` still reaches the error page, a `Run teams-token` button appears for 
 - `i`: focus compose input
 - `Enter` (compose): send message
 - `Esc` (compose): back to tree
-- `f`: toggle favorite chat
+- `f`: toggle favorite for selected/hovered chat
 - `u`: refresh chat titles
+- `r`: mark selected chat unread
+- `m`: toggle 1-minute unread scan on/off
+- `Shift+M`: run unread scan immediately
+
+## Feature Roadmap
+
+Planned messaging/UX improvements:
+- TTS playback for messages
+- Inline image viewer for chat attachments
+- Reactions support (view/add)
+- Reply/thread support from CLI
+- Better unread detection and sync accuracy
 
 ## Packaging Roadmap
 
