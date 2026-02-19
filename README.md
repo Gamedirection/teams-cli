@@ -97,6 +97,7 @@ If a `401` still reaches the error page, a `Run teams-token` button appears for 
 - Mentions in compose:
   - `@name` prefers current chat members, then global contacts
   - `c@name` forces global contacts lookup
+  - while typing mention token, use `Up/Down` in compose to cycle suggestions and prefill
 - Custom keybindings via config file: `~/.config/fossteams/teams-cli-keybindings.json`
 - Keybinding presets: `default`, `vim`, `emacs`, `jk`
 - Encrypted persistence of:
