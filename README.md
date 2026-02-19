@@ -94,6 +94,9 @@ If a `401` still reaches the error page, a `Run teams-token` button appears for 
 - Message reactions display in chat (`Reactions: ...`)
 - Quick react hotkey in chat (`e` adds 👍 to selected message, server + local fallback)
 - Reply mode in chat (`r` replies to selected message)
+- Mentions in compose:
+  - `@name` prefers current chat members, then global contacts
+  - `c@name` forces global contacts lookup
 - Custom keybindings via config file: `~/.config/fossteams/teams-cli-keybindings.json`
 - Keybinding presets: `default`, `vim`, `emacs`, `jk`
 - Encrypted persistence of:
