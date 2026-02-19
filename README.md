@@ -23,6 +23,16 @@ we have a product with more features.
 go run ./
 ```
 
+This repo includes `teams-token` as a git submodule for auth auto-refresh on `401 Unauthorized` responses.
+After cloning `teams-cli`, initialize submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+When `teams-cli` hits a `401`, it will try to run `./teams-token` (or `go run .` inside `./teams-token`)
+to refresh tokens, then retry the request once.
+
 If everything goes well, you should see something like this:
 ![Teams CLI example](./docs/screenshots/2021-04-13.png)
 <img width="1708" height="881" alt="image" src="https://github.com/user-attachments/assets/899b4aa5-f00e-4d6b-85b8-7dd9f3b07080" />
@@ -40,6 +50,7 @@ If everything goes well, you should see something like this:
   - Press `f` on a chat to add/remove it from `Chats > Favorites`
   - Your personal `Private Notes` chat is detected and included in Favorites
 - Press `u` in the chat tree to refresh chat titles with better author/name resolution
+- Automatic auth retry after `401 Unauthorized` when optional `./teams-token` is present
 
 ## What doesn't work
 
