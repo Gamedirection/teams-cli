@@ -53,6 +53,7 @@ type AppState struct {
 
 	settingsPath string
 	settingsKey  string
+	keybindPath  string
 
 	unreadScanMu       sync.RWMutex
 	unreadScanEnabled  bool
@@ -73,6 +74,17 @@ type AppState struct {
 
 	messageReactionsMu sync.RWMutex
 	messageReactions   map[string]string
+
+	keybindMu        sync.RWMutex
+	keybindings      map[string][]string
+	keybindPreset    string
+	keybindOverrides map[string][]string
+	keybindParseErr  error
+
+	settingsMu            sync.RWMutex
+	settingsMode          bool
+	settingsSelection     int
+	settingsCaptureAction string
 }
 
 type conversationRef struct {
@@ -101,9 +113,42 @@ type persistedChatSettings struct {
 	UnreadOverrides map[string]bool   `json:"unread_overrides,omitempty"`
 }
 
+type keybindingConfigFile struct {
+	Preset   string              `json:"preset"`
+	Bindings map[string][]string `json:"bindings"`
+}
+
+type settingsItem struct {
+	kind   string
+	action string
+}
+
 const composeDefaultPlaceholder = "Press i to compose, f to toggle favorite chat, Enter to send, Esc to return"
 const settingsHelpChatKey = "__settings_help__"
 const defaultReactionKey = "like"
+const defaultKeybindPreset = "default"
+
+const (
+	settingsItemInfo    = "info"
+	settingsItemOpen    = "open_editor"
+	settingsItemPreset  = "preset"
+	settingsItemReload  = "reload"
+	settingsItemBinding = "binding"
+)
+
+const (
+	actionToggleScan     = "toggle_scan"
+	actionScanNow        = "scan_now"
+	actionMarkUnread     = "mark_unread"
+	actionToggleFavorite = "toggle_favorite"
+	actionRefreshTitles  = "refresh_titles"
+	actionReloadKeybinds = "reload_keybindings"
+	actionFocusCompose   = "focus_compose"
+	actionReplyMessage   = "reply_message"
+	actionReactMessage   = "react_message"
+	actionMoveDown       = "move_down"
+	actionMoveUp         = "move_up"
+)
 
 func (s *AppState) createApp() {
 	s.logger.Debug("creating application pages and components")
@@ -117,6 +162,14 @@ func (s *AppState) createApp() {
 	s.manualUnread = map[string]bool{}
 	s.messageReactions = map[string]string{}
 	s.settingsPath, s.settingsKey = defaultSettingsPaths()
+	s.keybindPath = defaultKeybindPath()
+	s.keybindPreset = defaultKeybindPreset
+	s.keybindings = defaultKeybindingsForPreset(defaultKeybindPreset)
+	s.keybindOverrides = map[string][]string{}
+	if err := s.loadKeybindingsConfig(); err != nil {
+		s.keybindParseErr = err
+		s.logger.WithError(err).Warn("unable to load keybinding config")
+	}
 	if err := s.loadEncryptedChatSettings(); err != nil {
 		s.logger.WithError(err).Warn("unable to load encrypted chat settings")
 	}
@@ -532,6 +585,15 @@ func (s *AppState) fillMainWindow() {
 	}).Debug("chat tree nodes prepared")
 
 	treeView.SetSelectedFunc(func(node *tview.TreeNode) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				s.logger.WithFields(logrus.Fields{
+					"panic": recovered,
+					"stack": string(debug.Stack()),
+				}).Error("panic in tree selected handler")
+			}
+		}()
+
 		s.logger.WithField("node_text", node.GetText()).Debug("tree node selected")
 		reference := node.GetReference()
 		if reference == nil {
@@ -594,14 +656,20 @@ func (s *AppState) fillMainWindow() {
 			}
 		}()
 
-		if event.Key() == tcell.KeyRune && event.Rune() == 'm' {
+		if s.bindingMatches(actionMoveDown, event) {
+			return tcell.NewEventKey(tcell.KeyDown, 0, event.Modifiers())
+		}
+		if s.bindingMatches(actionMoveUp, event) {
+			return tcell.NewEventKey(tcell.KeyUp, 0, event.Modifiers())
+		}
+		if s.bindingMatches(actionToggleScan, event) {
 			enabled := s.toggleUnreadScanEnabled()
 			s.logger.WithField("enabled", enabled).Info("unread scan toggle changed")
 			s.updateScanStatusTitle()
 			composeView.SetTitle(s.composeTitleWithScanStatus())
 			return nil
 		}
-		if event.Key() == tcell.KeyRune && event.Rune() == 'M' {
+		if s.bindingMatches(actionScanNow, event) {
 			if s.markUnreadScanStart() {
 				composeView.SetTitle(s.composeTitleWithScanStatus())
 				go s.refreshUnreadMarkers(chatsNode)
@@ -610,7 +678,7 @@ func (s *AppState) fillMainWindow() {
 			}
 			return nil
 		}
-		if event.Key() == tcell.KeyRune && (event.Rune() == 'r' || event.Rune() == 'R') {
+		if s.bindingMatches(actionMarkUnread, event) {
 			selected := treeView.GetCurrentNode()
 			if selected == nil {
 				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Select a chat first")
@@ -632,17 +700,25 @@ func (s *AppState) fillMainWindow() {
 			}).Debug("marked chat unread manually")
 			return nil
 		}
-		if event.Key() == tcell.KeyRune && (event.Rune() == 'f' || event.Rune() == 'F') {
+		if s.bindingMatches(actionToggleFavorite, event) {
 			if s.toggleFavoriteForCurrentNode(treeView, chatsNode, favoritesNode, recentNode) {
 				return nil
 			}
 			return event
 		}
-		if event.Key() == tcell.KeyRune && (event.Rune() == 'u' || event.Rune() == 'U') {
+		if s.bindingMatches(actionRefreshTitles, event) {
 			go s.refreshAllChatLabels(chatsNode)
 			return nil
 		}
-		if event.Key() == tcell.KeyRune && (event.Rune() == 'i' || event.Rune() == 'I') {
+		if s.bindingMatches(actionReloadKeybinds, event) {
+			if err := s.reloadKeybindingsConfig(); err != nil {
+				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Keybind reload failed")
+			} else {
+				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Keybindings reloaded")
+			}
+			return nil
+		}
+		if s.bindingMatches(actionFocusCompose, event) {
 			ids, _, _ := s.getActiveConversation()
 			if len(ids) == 0 {
 				return event
@@ -663,7 +739,60 @@ func (s *AppState) fillMainWindow() {
 			}
 		}()
 
-		if event.Key() == tcell.KeyRune && (event.Rune() == 'r' || event.Rune() == 'R') {
+		if s.isSettingsMode() {
+			if s.bindingMatches(actionMoveDown, event) {
+				return tcell.NewEventKey(tcell.KeyDown, 0, event.Modifiers())
+			}
+			if s.bindingMatches(actionMoveUp, event) {
+				return tcell.NewEventKey(tcell.KeyUp, 0, event.Modifiers())
+			}
+			captureAction := s.getSettingsCaptureAction()
+			if captureAction != "" {
+				composeView := s.components[ViCompose].(*tview.InputField)
+				if event.Key() == tcell.KeyEscape {
+					if err := s.resetActionBindingToDefault(captureAction); err != nil {
+						composeView.SetTitle(s.composeTitleWithScanStatus() + " | Reset failed")
+					} else {
+						composeView.SetTitle(s.composeTitleWithScanStatus() + " | Reset to preset default")
+					}
+					s.clearSettingsCaptureAction()
+					s.renderSettingsHelpItems(chatView)
+					return nil
+				}
+				token := eventToKeybindToken(event)
+				if token == "" {
+					composeView.SetTitle(s.composeTitleWithScanStatus() + " | Unsupported key (use config for complex)")
+					return nil
+				}
+				if err := s.setActionBinding(captureAction, token); err != nil {
+					composeView.SetTitle(s.composeTitleWithScanStatus() + " | Save binding failed")
+				} else {
+					composeView.SetTitle(s.composeTitleWithScanStatus() + " | Bound " + captureAction + " -> " + token)
+				}
+				s.clearSettingsCaptureAction()
+				s.renderSettingsHelpItems(chatView)
+				return nil
+			}
+			if s.bindingMatches(actionReloadKeybinds, event) {
+				if err := s.reloadKeybindingsConfig(); err != nil {
+					composeView.SetTitle(s.composeTitleWithScanStatus() + " | Keybind reload failed")
+				} else {
+					composeView.SetTitle(s.composeTitleWithScanStatus() + " | Keybindings reloaded")
+				}
+				s.renderSettingsHelpItems(chatView)
+				return nil
+			}
+			return event
+		}
+
+		if s.bindingMatches(actionMoveDown, event) {
+			return tcell.NewEventKey(tcell.KeyDown, 0, event.Modifiers())
+		}
+		if s.bindingMatches(actionMoveUp, event) {
+			return tcell.NewEventKey(tcell.KeyUp, 0, event.Modifiers())
+		}
+
+		if s.bindingMatches(actionReplyMessage, event) {
 			current := chatView.GetCurrentItem()
 			if current < 0 {
 				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Select a message first")
@@ -688,7 +817,7 @@ func (s *AppState) fillMainWindow() {
 			s.app.SetFocus(composeView)
 			return nil
 		}
-		if event.Key() == tcell.KeyRune && (event.Rune() == 'e' || event.Rune() == 'E') {
+		if s.bindingMatches(actionReactMessage, event) {
 			current := chatView.GetCurrentItem()
 			if current < 0 {
 				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Select a message first")
@@ -701,6 +830,14 @@ func (s *AppState) fillMainWindow() {
 			}
 			go s.reactToMessage(msg, defaultReactionKey)
 			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Reacted 👍")
+			return nil
+		}
+		if s.bindingMatches(actionReloadKeybinds, event) {
+			if err := s.reloadKeybindingsConfig(); err != nil {
+				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Keybind reload failed")
+			} else {
+				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Keybindings reloaded")
+			}
 			return nil
 		}
 		return event
@@ -762,6 +899,7 @@ func (s *AppState) setActiveConversation(selectedNode *tview.TreeNode, conversat
 	s.activeConversationTitle = title
 	s.activeConversationNode = selectedNode
 	s.activeConversationMu.Unlock()
+	s.setSettingsMode(false)
 	s.clearPendingReply()
 	s.updateComposeReplyUI()
 }
@@ -772,18 +910,249 @@ func (s *AppState) showSettingsHelpChat(title string) {
 	chatList.SetTitle(title).
 		SetBorder(true).
 		SetTitleAlign(tview.AlignCenter)
-	chatList.AddItem("teams-cli Help", "Use Tab/Shift+Tab to cycle panes", 0, nil)
-	chatList.AddItem("Favorites", "f on a chat to toggle favorite", 0, nil)
-	chatList.AddItem("Unread Scanner", "m toggle scanner, Shift+M scan now", 0, nil)
-	chatList.AddItem("Manual Unread", "r in tree marks selected chat unread", 0, nil)
-	chatList.AddItem("Reply", "r in chat replies to selected message", 0, nil)
-	chatList.AddItem("React", "e in chat adds 👍 to selected message", 0, nil)
-	chatList.AddItem("Refresh Chat Names", "u refreshes DM titles/authors", 0, nil)
-	chatList.AddItem("Private Notes", "Personal notes chat auto-detected in Favorites", 0, nil)
+	s.renderSettingsHelpItems(chatList)
+	chatList.SetChangedFunc(func(index int, _ string, _ string, _ rune) {
+		s.setSettingsSelection(index)
+	})
+	chatList.SetSelectedFunc(func(index int, _ string, _ string, _ rune) {
+		s.handleSettingsSelection(index)
+	})
 
 	s.setCurrentChatMessages(nil)
 	s.setActiveConversation(nil, nil, title)
-	s.app.Draw()
+	s.settingsMu.Lock()
+	s.settingsMode = true
+	s.settingsSelection = 0
+	s.settingsCaptureAction = ""
+	s.settingsMu.Unlock()
+	s.logger.Debug("settings/help chat rendered")
+}
+
+func (s *AppState) renderSettingsHelpItems(chatList *tview.List) {
+	if chatList == nil {
+		return
+	}
+	selection := s.getSettingsSelection()
+	items := s.buildSettingsItems()
+	chatList.Clear()
+	for _, item := range items {
+		switch item.kind {
+		case settingsItemOpen:
+			chatList.AddItem("Open Keybindings Config", s.keybindPath+" (Enter)", 0, nil)
+		case settingsItemPreset:
+			chatList.AddItem("Preset", s.formatPresetLine()+" (Enter to cycle)", 0, nil)
+		case settingsItemReload:
+			chatList.AddItem("Reload Keybindings", "Reload from config file (Enter/Ctrl+R)", 0, nil)
+		case settingsItemBinding:
+			chatList.AddItem("Bind "+item.action, s.formatActionBindingLine(item.action)+" (Enter to rebind)", 0, nil)
+		default:
+			chatList.AddItem("Help", "Esc in bind mode resets that action to preset default", 0, nil)
+		}
+	}
+	if selection >= 0 && selection < chatList.GetItemCount() {
+		chatList.SetCurrentItem(selection)
+	}
+}
+
+func (s *AppState) buildSettingsItems() []settingsItem {
+	return []settingsItem{
+		{kind: settingsItemOpen},
+		{kind: settingsItemPreset},
+		{kind: settingsItemReload},
+		{kind: settingsItemBinding, action: actionMoveDown},
+		{kind: settingsItemBinding, action: actionMoveUp},
+		{kind: settingsItemBinding, action: actionFocusCompose},
+		{kind: settingsItemBinding, action: actionToggleFavorite},
+		{kind: settingsItemBinding, action: actionMarkUnread},
+		{kind: settingsItemBinding, action: actionReplyMessage},
+		{kind: settingsItemBinding, action: actionReactMessage},
+		{kind: settingsItemBinding, action: actionRefreshTitles},
+		{kind: settingsItemBinding, action: actionToggleScan},
+		{kind: settingsItemBinding, action: actionScanNow},
+		{kind: settingsItemBinding, action: actionReloadKeybinds},
+		{kind: settingsItemInfo},
+	}
+}
+
+func (s *AppState) handleSettingsSelection(index int) {
+	items := s.buildSettingsItems()
+	if index < 0 || index >= len(items) {
+		return
+	}
+	s.setSettingsSelection(index)
+	item := items[index]
+	composeView := s.components[ViCompose].(*tview.InputField)
+	switch item.kind {
+	case settingsItemOpen:
+		err := s.openKeybindConfigInEditor()
+		if err != nil {
+			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Unable to open editor")
+		} else {
+			_ = s.reloadKeybindingsConfig()
+			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Editor closed, keybindings reloaded")
+		}
+		s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
+	case settingsItemPreset:
+		next := nextPreset(s.getCurrentKeybindPreset())
+		if err := s.setKeybindPreset(next); err != nil {
+			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Preset change failed")
+		} else {
+			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Preset: " + next)
+		}
+		s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
+	case settingsItemReload:
+		if err := s.reloadKeybindingsConfig(); err != nil {
+			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Keybind reload failed")
+		} else {
+			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Keybindings reloaded")
+		}
+		s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
+	case settingsItemBinding:
+		s.settingsMu.Lock()
+		s.settingsCaptureAction = item.action
+		s.settingsMu.Unlock()
+		composeView.SetTitle(s.composeTitleWithScanStatus() + " | Press new key or Esc for default")
+	}
+}
+
+func nextPreset(current string) string {
+	order := []string{"default", "vim", "emacs", "jk"}
+	current = strings.ToLower(strings.TrimSpace(current))
+	for i, v := range order {
+		if v == current {
+			return order[(i+1)%len(order)]
+		}
+	}
+	return order[0]
+}
+
+func (s *AppState) getCurrentKeybindPreset() string {
+	s.keybindMu.RLock()
+	defer s.keybindMu.RUnlock()
+	return s.keybindPreset
+}
+
+func (s *AppState) formatPresetLine() string {
+	current := strings.ToLower(strings.TrimSpace(s.getCurrentKeybindPreset()))
+	all := []string{"default", "vim", "emacs", "jk"}
+	parts := make([]string, 0, len(all))
+	for _, p := range all {
+		if p == current {
+			parts = append(parts, "["+p+"]")
+		} else {
+			parts = append(parts, p)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func (s *AppState) formatActionBindingLine(action string) string {
+	s.keybindMu.RLock()
+	keys := append([]string(nil), s.keybindings[action]...)
+	s.keybindMu.RUnlock()
+	if len(keys) == 0 {
+		return "(none)"
+	}
+	return strings.Join(keys, ", ")
+}
+
+func (s *AppState) isSettingsMode() bool {
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
+	return s.settingsMode
+}
+
+func (s *AppState) setSettingsMode(v bool) {
+	s.settingsMu.Lock()
+	s.settingsMode = v
+	if !v {
+		s.settingsCaptureAction = ""
+	}
+	s.settingsMu.Unlock()
+}
+
+func (s *AppState) getSettingsSelection() int {
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
+	return s.settingsSelection
+}
+
+func (s *AppState) setSettingsSelection(index int) {
+	s.settingsMu.Lock()
+	s.settingsSelection = index
+	s.settingsMu.Unlock()
+}
+
+func (s *AppState) getSettingsCaptureAction() string {
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
+	return s.settingsCaptureAction
+}
+
+func (s *AppState) clearSettingsCaptureAction() {
+	s.settingsMu.Lock()
+	s.settingsCaptureAction = ""
+	s.settingsMu.Unlock()
+}
+
+func (s *AppState) openKeybindConfigInEditor() error {
+	editor := strings.TrimSpace(os.Getenv("VISUAL"))
+	if editor == "" {
+		editor = strings.TrimSpace(os.Getenv("EDITOR"))
+	}
+	if editor == "" {
+		editor = "nano"
+	}
+	parts := strings.Fields(editor)
+	if len(parts) == 0 {
+		parts = []string{"nano"}
+	}
+	args := append(parts[1:], s.keybindPath)
+	cmd := exec.Command(parts[0], args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	var runErr error
+	s.app.Suspend(func() {
+		runErr = cmd.Run()
+	})
+	return runErr
+}
+
+func eventToKeybindToken(event *tcell.EventKey) string {
+	if event == nil {
+		return ""
+	}
+	switch event.Key() {
+	case tcell.KeyUp:
+		return "up"
+	case tcell.KeyDown:
+		return "down"
+	case tcell.KeyLeft:
+		return "left"
+	case tcell.KeyRight:
+		return "right"
+	case tcell.KeyEnter:
+		return "enter"
+	case tcell.KeyEscape:
+		return "esc"
+	case tcell.KeyCtrlN:
+		return "ctrl+n"
+	case tcell.KeyCtrlP:
+		return "ctrl+p"
+	case tcell.KeyCtrlX:
+		return "ctrl+x"
+	case tcell.KeyCtrlR:
+		return "ctrl+r"
+	case tcell.KeyRune:
+		r := event.Rune()
+		if r == 0 {
+			return ""
+		}
+		return string(r)
+	default:
+		return ""
+	}
 }
 
 func (s *AppState) getActiveConversation() ([]string, string, *tview.TreeNode) {
@@ -1726,7 +2095,7 @@ func (s *AppState) reactToMessage(message csa.ChatMessage, reaction string) {
 	}
 
 	s.setLocalMessageReaction(conversationID, messageID, reaction)
-	if err := s.sendReaction(conversationID, messageID, reaction); err != nil {
+	if err := s.sendReaction(message, reaction); err != nil {
 		s.logger.WithError(err).WithFields(logrus.Fields{
 			"conversation_id": conversationID,
 			"message_id":      messageID,
@@ -1740,7 +2109,13 @@ func (s *AppState) reactToMessage(message csa.ChatMessage, reaction string) {
 	}
 }
 
-func (s *AppState) sendReaction(conversationID, messageID, reaction string) error {
+func (s *AppState) sendReaction(message csa.ChatMessage, reaction string) error {
+	conversationID := strings.TrimSpace(message.ConversationId)
+	messageID := strings.TrimSpace(message.Id)
+	if conversationID == "" || messageID == "" {
+		return fmt.Errorf("missing conversation or message id for reaction")
+	}
+
 	userMri := ""
 	if s.me != nil {
 		userMri = strings.TrimSpace(s.me.Mri)
@@ -1748,23 +2123,60 @@ func (s *AppState) sendReaction(conversationID, messageID, reaction string) erro
 			userMri = "8:orgid:" + strings.TrimSpace(s.me.ObjectId)
 		}
 	}
-	emotionsPayload := fmt.Sprintf(`[{"key":"%s","users":[{"mri":"%s","time":%d,"value":""}]}]`,
-		reaction, userMri, time.Now().UnixMilli())
-	bodyBytes, err := json.Marshal(map[string]interface{}{
-		"emotions": emotionsPayload,
-	})
+	emotionsPayload, err := buildEmotionsPayload(message, reaction, userMri)
 	if err != nil {
 		return fmt.Errorf("unable to encode reaction payload: %v", err)
 	}
 
-	endpoints := []string{
-		csa.MessagesHost + "v1/users/ME/conversations/" + url.QueryEscape(conversationID) + "/messages/" + url.QueryEscape(messageID) + "/properties",
-		csa.MessagesHost + "v1/users/ME/conversations/" + url.QueryEscape(conversationID) + "/messages/" + url.QueryEscape(messageID) + "/properties?name=emotions",
+	bodyMapEmotions, err := json.Marshal(map[string]interface{}{
+		"emotions": emotionsPayload,
+	})
+	if err != nil {
+		return fmt.Errorf("unable to encode reaction emotions map: %v", err)
+	}
+	bodyMapProperties, err := json.Marshal(map[string]interface{}{
+		"properties": map[string]interface{}{
+			"emotions": emotionsPayload,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("unable to encode reaction properties map: %v", err)
+	}
+	bodyValueOnly, err := json.Marshal(map[string]interface{}{
+		"value": emotionsPayload,
+	})
+	if err != nil {
+		return fmt.Errorf("unable to encode reaction value payload: %v", err)
+	}
+	bodyJSONString, err := json.Marshal(emotionsPayload)
+	if err != nil {
+		return fmt.Errorf("unable to encode reaction json string payload: %v", err)
+	}
+
+	base := csa.MessagesHost + "v1/users/ME/conversations/" + url.QueryEscape(conversationID) + "/messages/" + url.QueryEscape(messageID)
+	type reactionAttempt struct {
+		method   string
+		endpoint string
+		body     []byte
+	}
+	attempts := []reactionAttempt{
+		{method: http.MethodPut, endpoint: base + "/properties", body: bodyMapEmotions},
+		{method: http.MethodPatch, endpoint: base + "/properties", body: bodyMapEmotions},
+		{method: http.MethodPatch, endpoint: base, body: bodyMapProperties},
+		{method: http.MethodPut, endpoint: base + "/properties?name=emotions", body: bodyJSONString},
+		{method: http.MethodPut, endpoint: base + "/properties?name=emotions", body: bodyValueOnly},
+		{method: http.MethodPut, endpoint: base + "/properties?name=emotions", body: bodyMapEmotions},
 	}
 	var lastErr error
-	for _, endpoint := range endpoints {
-		err = s.sendReactionRequest(endpoint, bodyBytes)
+	for _, attempt := range attempts {
+		err = s.sendReactionRequest(attempt.method, attempt.endpoint, attempt.body)
 		if err == nil {
+			s.logger.WithFields(logrus.Fields{
+				"method":          attempt.method,
+				"endpoint":        attempt.endpoint,
+				"conversation_id": conversationID,
+				"message_id":      messageID,
+			}).Info("reaction sent")
 			return nil
 		}
 		lastErr = err
@@ -1775,10 +2187,76 @@ func (s *AppState) sendReaction(conversationID, messageID, reaction string) erro
 	return lastErr
 }
 
-func (s *AppState) sendReactionRequest(endpoint string, body []byte) error {
+func buildEmotionsPayload(message csa.ChatMessage, reaction, userMri string) (string, error) {
+	type userEmotionWire struct {
+		Mri   string `json:"mri"`
+		Time  int64  `json:"time"`
+		Value string `json:"value"`
+	}
+	type emotionWire struct {
+		Key   string            `json:"key"`
+		Users []userEmotionWire `json:"users"`
+	}
+
+	byKey := map[string]map[string]userEmotionWire{}
+	order := []string{}
+	for _, emotion := range message.Properties.Emotions {
+		key := strings.TrimSpace(strings.ToLower(emotion.Key))
+		if key == "" {
+			continue
+		}
+		if _, ok := byKey[key]; !ok {
+			byKey[key] = map[string]userEmotionWire{}
+			order = append(order, key)
+		}
+		for _, u := range emotion.Users {
+			mri := strings.TrimSpace(u.Mri)
+			if mri == "" {
+				continue
+			}
+			byKey[key][mri] = userEmotionWire{Mri: mri, Time: u.Time, Value: strings.TrimSpace(u.Value)}
+		}
+	}
+
+	reaction = strings.TrimSpace(strings.ToLower(reaction))
+	if reaction == "" {
+		reaction = defaultReactionKey
+	}
+	if _, ok := byKey[reaction]; !ok {
+		byKey[reaction] = map[string]userEmotionWire{}
+		order = append(order, reaction)
+	}
+	if strings.TrimSpace(userMri) != "" {
+		byKey[reaction][userMri] = userEmotionWire{
+			Mri:   strings.TrimSpace(userMri),
+			Time:  time.Now().UnixMilli(),
+			Value: reaction,
+		}
+	}
+
+	wires := []emotionWire{}
+	for _, key := range order {
+		usersMap := byKey[key]
+		users := make([]userEmotionWire, 0, len(usersMap))
+		for _, u := range usersMap {
+			users = append(users, u)
+		}
+		sort.Slice(users, func(i, j int) bool {
+			return users[i].Mri < users[j].Mri
+		})
+		wires = append(wires, emotionWire{Key: key, Users: users})
+	}
+	bytesOut, err := json.Marshal(wires)
+	if err != nil {
+		return "", err
+	}
+	return string(bytesOut), nil
+}
+
+func (s *AppState) sendReactionRequest(method, endpoint string, body []byte) error {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		req, err := s.teamsClient.ChatSvc().AuthenticatedRequest(http.MethodPut, endpoint, bytes.NewReader(body))
+		req, err := s.teamsClient.ChatSvc().AuthenticatedRequest(method, endpoint, bytes.NewReader(body))
 		if err != nil {
 			if attempt == 0 && isUnauthorizedError(err) {
 				if refreshErr := s.refreshAuthFromTeamsToken(); refreshErr == nil {
@@ -1805,7 +2283,7 @@ func (s *AppState) sendReactionRequest(endpoint string, body []byte) error {
 				continue
 			}
 		}
-		lastErr = fmt.Errorf("status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		lastErr = fmt.Errorf("%s %s status=%d body=%s", method, endpoint, resp.StatusCode, strings.TrimSpace(string(respBody)))
 		break
 	}
 	if lastErr == nil {
@@ -1938,6 +2416,8 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 	// Clear chat
 	chatList := s.components[ViChat].(*tview.List)
 	chatList.Clear()
+	chatList.SetSelectedFunc(nil)
+	chatList.SetChangedFunc(nil)
 	s.setCurrentChatMessages(messages)
 	s.logger.WithFields(logrus.Fields{
 		"display_name":   displayName,
@@ -1984,6 +2464,251 @@ func defaultSettingsPaths() (string, string) {
 	}
 	configDir := filepath.Join(homeDir, ".config", "fossteams")
 	return filepath.Join(configDir, "teams-cli-settings.enc"), filepath.Join(configDir, "teams-cli-settings.key")
+}
+
+func defaultKeybindPath() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(homeDir) == "" {
+		return "teams-cli-keybindings.json"
+	}
+	return filepath.Join(homeDir, ".config", "fossteams", "teams-cli-keybindings.json")
+}
+
+func defaultKeybindingsForPreset(preset string) map[string][]string {
+	b := map[string][]string{
+		actionToggleScan:     {"m"},
+		actionScanNow:        {"shift+m"},
+		actionMarkUnread:     {"r"},
+		actionToggleFavorite: {"f"},
+		actionRefreshTitles:  {"u"},
+		actionReloadKeybinds: {"ctrl+r"},
+		actionFocusCompose:   {"i"},
+		actionReplyMessage:   {"r"},
+		actionReactMessage:   {"e"},
+		actionMoveDown:       {"down"},
+		actionMoveUp:         {"up"},
+	}
+
+	switch strings.ToLower(strings.TrimSpace(preset)) {
+	case "jk":
+		b[actionMoveDown] = append([]string(nil), b[actionMoveDown]...)
+		b[actionMoveDown] = append(b[actionMoveDown], "j")
+		b[actionMoveUp] = append([]string(nil), b[actionMoveUp]...)
+		b[actionMoveUp] = append(b[actionMoveUp], "k", "K")
+	case "vim":
+		b[actionMoveDown] = append([]string(nil), b[actionMoveDown]...)
+		b[actionMoveDown] = append(b[actionMoveDown], "j")
+		b[actionMoveUp] = append([]string(nil), b[actionMoveUp]...)
+		b[actionMoveUp] = append(b[actionMoveUp], "k", "K")
+		b[actionFocusCompose] = []string{"i", "c"}
+	case "emacs":
+		b[actionMoveDown] = []string{"down", "ctrl+n"}
+		b[actionMoveUp] = []string{"up", "ctrl+p"}
+		b[actionFocusCompose] = []string{"i", "ctrl+x"}
+	}
+	return b
+}
+
+func mergeKeybindings(base map[string][]string, overrides map[string][]string) map[string][]string {
+	out := map[string][]string{}
+	for action, keys := range base {
+		out[action] = append([]string(nil), keys...)
+	}
+	for action, keys := range overrides {
+		if len(keys) == 0 {
+			continue
+		}
+		out[action] = append([]string(nil), keys...)
+	}
+	return out
+}
+
+func (s *AppState) loadKeybindingsConfig() error {
+	if strings.TrimSpace(s.keybindPath) == "" {
+		return nil
+	}
+	data, err := os.ReadFile(s.keybindPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return s.writeDefaultKeybindingsConfig()
+		}
+		return err
+	}
+	var cfg keybindingConfigFile
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("invalid keybinding config json: %v", err)
+	}
+	preset := strings.ToLower(strings.TrimSpace(cfg.Preset))
+	if preset == "" {
+		preset = defaultKeybindPreset
+	}
+	base := defaultKeybindingsForPreset(preset)
+	overrides := map[string][]string{}
+	for action, keys := range cfg.Bindings {
+		if len(keys) == 0 {
+			continue
+		}
+		overrides[action] = append([]string(nil), keys...)
+	}
+	merged := mergeKeybindings(base, overrides)
+
+	s.keybindMu.Lock()
+	s.keybindPreset = preset
+	s.keybindings = merged
+	s.keybindOverrides = overrides
+	s.keybindMu.Unlock()
+	return nil
+}
+
+func (s *AppState) reloadKeybindingsConfig() error {
+	err := s.loadKeybindingsConfig()
+	s.keybindParseErr = err
+	return err
+}
+
+func (s *AppState) saveKeybindingsConfig() error {
+	if strings.TrimSpace(s.keybindPath) == "" {
+		return nil
+	}
+	s.keybindMu.RLock()
+	cfg := keybindingConfigFile{
+		Preset:   s.keybindPreset,
+		Bindings: map[string][]string{},
+	}
+	for action, keys := range s.keybindOverrides {
+		if len(keys) == 0 {
+			continue
+		}
+		cfg.Bindings[action] = append([]string(nil), keys...)
+	}
+	s.keybindMu.RUnlock()
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(s.keybindPath), 0o700); err != nil {
+		return err
+	}
+	tmpPath := s.keybindPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, s.keybindPath)
+}
+
+func (s *AppState) setKeybindPreset(preset string) error {
+	preset = strings.ToLower(strings.TrimSpace(preset))
+	if preset == "" {
+		preset = defaultKeybindPreset
+	}
+	base := defaultKeybindingsForPreset(preset)
+	s.keybindMu.Lock()
+	s.keybindPreset = preset
+	s.keybindOverrides = map[string][]string{}
+	s.keybindings = base
+	s.keybindMu.Unlock()
+	return s.saveKeybindingsConfig()
+}
+
+func (s *AppState) setActionBinding(action, token string) error {
+	action = strings.TrimSpace(action)
+	token = strings.TrimSpace(token)
+	if action == "" || token == "" {
+		return fmt.Errorf("action or token is empty")
+	}
+	s.keybindMu.Lock()
+	if s.keybindOverrides == nil {
+		s.keybindOverrides = map[string][]string{}
+	}
+	s.keybindOverrides[action] = []string{token}
+	base := defaultKeybindingsForPreset(s.keybindPreset)
+	s.keybindings = mergeKeybindings(base, s.keybindOverrides)
+	s.keybindMu.Unlock()
+	return s.saveKeybindingsConfig()
+}
+
+func (s *AppState) resetActionBindingToDefault(action string) error {
+	action = strings.TrimSpace(action)
+	if action == "" {
+		return fmt.Errorf("action is empty")
+	}
+	s.keybindMu.Lock()
+	if s.keybindOverrides != nil {
+		delete(s.keybindOverrides, action)
+	}
+	base := defaultKeybindingsForPreset(s.keybindPreset)
+	s.keybindings = mergeKeybindings(base, s.keybindOverrides)
+	s.keybindMu.Unlock()
+	return s.saveKeybindingsConfig()
+}
+
+func (s *AppState) writeDefaultKeybindingsConfig() error {
+	if strings.TrimSpace(s.keybindPath) == "" {
+		return nil
+	}
+	cfg := keybindingConfigFile{
+		Preset:   defaultKeybindPreset,
+		Bindings: map[string][]string{},
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(s.keybindPath), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(s.keybindPath, data, 0o600)
+}
+
+func (s *AppState) bindingMatches(action string, event *tcell.EventKey) bool {
+	if event == nil {
+		return false
+	}
+	s.keybindMu.RLock()
+	tokens := append([]string(nil), s.keybindings[action]...)
+	s.keybindMu.RUnlock()
+	for _, token := range tokens {
+		if keyTokenMatches(strings.TrimSpace(token), event) {
+			return true
+		}
+	}
+	return false
+}
+
+func keyTokenMatches(token string, event *tcell.EventKey) bool {
+	if token == "" || event == nil {
+		return false
+	}
+	switch strings.ToLower(token) {
+	case "up":
+		return event.Key() == tcell.KeyUp
+	case "down":
+		return event.Key() == tcell.KeyDown
+	case "left":
+		return event.Key() == tcell.KeyLeft
+	case "right":
+		return event.Key() == tcell.KeyRight
+	case "enter":
+		return event.Key() == tcell.KeyEnter
+	case "esc":
+		return event.Key() == tcell.KeyEscape
+	case "ctrl+n":
+		return event.Key() == tcell.KeyCtrlN
+	case "ctrl+p":
+		return event.Key() == tcell.KeyCtrlP
+	case "ctrl+r":
+		return event.Key() == tcell.KeyCtrlR
+	case "ctrl+x":
+		return event.Key() == tcell.KeyCtrlX
+	case "shift+m":
+		return event.Key() == tcell.KeyRune && event.Rune() == 'M'
+	}
+	if len([]rune(token)) == 1 {
+		r := []rune(token)[0]
+		return event.Key() == tcell.KeyRune && event.Rune() == r
+	}
+	return false
 }
 
 func (s *AppState) loadEncryptedChatSettings() error {

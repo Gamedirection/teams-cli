@@ -86,9 +86,16 @@ If a `401` still reaches the error page, a `Run teams-token` button appears for 
 - Compose title shows scanner status (`ON/OFF`), scan progress, and last scan result
 - Manual mark unread hotkey (`r`) for selected chat
 - Built-in `Settings & Help` chat at the bottom of the tree
+- In-app keybinding settings menu in `Settings & Help`:
+  - Enter on config row opens your `$VISUAL` / `$EDITOR`
+  - Enter on preset row cycles `default -> vim -> emacs -> jk`
+  - Enter on binding row captures a new single key
+  - `Esc` while capturing resets that action to preset default
 - Message reactions display in chat (`Reactions: ...`)
-- Quick react hotkey in chat (`e` adds 👍 to selected message)
+- Quick react hotkey in chat (`e` adds 👍 to selected message, server + local fallback)
 - Reply mode in chat (`r` replies to selected message)
+- Custom keybindings via config file: `~/.config/fossteams/teams-cli-keybindings.json`
+- Keybinding presets: `default`, `vim`, `emacs`, `jk`
 - Encrypted persistence of:
   - favorites
   - updated chat titles
@@ -110,6 +117,48 @@ If a `401` still reaches the error page, a `Run teams-token` button appears for 
 - `e` (chat pane): react 👍 to selected message
 - `m`: toggle 1-minute unread scan on/off
 - `Shift+M`: run unread scan immediately
+- `Ctrl+R`: reload keybindings config without restarting
+
+## Keybinding Config
+
+`teams-cli` creates keybinding config at:
+
+- `~/.config/fossteams/teams-cli-keybindings.json`
+
+Example:
+
+```json
+{
+  "preset": "vim",
+  "bindings": {
+    "react_message": ["e"],
+    "reply_message": ["r"],
+    "toggle_favorite": ["f"]
+  }
+}
+```
+
+Available actions:
+- `toggle_scan`
+- `scan_now`
+- `mark_unread`
+- `toggle_favorite`
+- `refresh_titles`
+- `focus_compose`
+- `reply_message`
+- `react_message`
+- `reload_keybindings`
+- `move_down`
+- `move_up`
+
+In-app keybinding editor notes:
+- Use `Settings & Help` chat and press `Tab` until chat pane is focused.
+- Press `Enter` on:
+  - `Open Keybindings Config` to launch your editor
+  - `Preset` to cycle presets
+  - `Bind ...` rows to set a new single key
+- Press `Esc` while binding to reset that action to preset default.
+- For multi-key or advanced mappings, edit `teams-cli-keybindings.json` directly.
 
 ## Feature Roadmap
 
