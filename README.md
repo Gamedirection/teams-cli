@@ -6,6 +6,8 @@
 
 A terminal UI for Microsoft Teams powered by [teams-api](https://github.com/fossteams/teams-api).
 
+Current stable version: `v1.0.0`
+
 ## Install
 
 ### Linux one-line install (from GitHub)
@@ -96,6 +98,11 @@ If a `401` still reaches the error page, a `Run teams-token` button appears for 
   - `Scroll` (single-line messages)
   - configurable wrap characters (`20/40/72/80/100/200/400/600/800/1000/custom`)
   - actual visible wrap is capped by current chat pane width
+  - wrap mode keeps the same message/author secondary styling as scroll mode
+- Theme color customization in `Settings & Help`:
+  - `Compose Color` cycles darker blue variants (`midnight`, `navy`, `dark_blue`, `slate`)
+  - `Username Color` cycles (`blue`, `yellow`, `green`, `cyan`, `white`)
+  - both are stored in encrypted settings
 - Message reactions display in chat (`Reactions: ...`)
 - Quick react hotkey in chat (`e` adds 👍 to selected message, server + local fallback)
 - Reply mode in chat (`r` replies to selected message)

@@ -101,6 +101,10 @@ type AppState struct {
 	chatWordWrap      bool
 	chatWrapChars     int
 	chatWrapEffective int
+
+	themeMu          sync.RWMutex
+	composeColorName string
+	authorColorName  string
 }
 
 type conversationRef struct {
@@ -144,6 +148,8 @@ type persistedChatSettings struct {
 	ChatWordWrap    *bool             `json:"chat_word_wrap,omitempty"`
 	ChatWrapPercent *int              `json:"chat_wrap_percent,omitempty"`
 	ChatWrapChars   *int              `json:"chat_wrap_chars,omitempty"`
+	ComposeColor    string            `json:"compose_color,omitempty"`
+	AuthorColor     string            `json:"author_color,omitempty"`
 }
 
 type keybindingConfigFile struct {
@@ -164,13 +170,16 @@ const defaultKeybindPreset = "default"
 var mentionTokenRegex = regexp.MustCompile(`(?m)(^|[\s])([cC]?@)([A-Za-z0-9._-]+)`)
 
 const (
-	settingsItemInfo    = "info"
-	settingsItemOpen    = "open_editor"
-	settingsItemPreset  = "preset"
-	settingsItemReload  = "reload"
-	settingsItemBinding = "binding"
-	settingsItemWrap    = "chat_wrap"
-	settingsItemWrapPct = "chat_wrap_pct"
+	settingsItemInfo         = "info"
+	settingsItemSpacer       = "spacer"
+	settingsItemOpen         = "open_editor"
+	settingsItemPreset       = "preset"
+	settingsItemReload       = "reload"
+	settingsItemBinding      = "binding"
+	settingsItemWrap         = "chat_wrap"
+	settingsItemWrapPct      = "chat_wrap_pct"
+	settingsItemComposeColor = "compose_color"
+	settingsItemAuthorColor  = "author_color"
 )
 
 const (
@@ -200,6 +209,8 @@ func (s *AppState) createApp() {
 	s.messageReactions = map[string]string{}
 	s.chatWordWrap = true
 	s.chatWrapChars = 80
+	s.composeColorName = "slate"
+	s.authorColorName = "blue"
 	s.settingsPath, s.settingsKey = defaultSettingsPaths()
 	s.keybindPath = defaultKeybindPath()
 	s.keybindPreset = defaultKeybindPreset
@@ -291,7 +302,7 @@ func (s *AppState) createMainView() tview.Primitive {
 		SetLabel("Message: ").
 		SetPlaceholder(composeDefaultPlaceholder)
 	composeView.SetFieldWidth(0)
-	composeView.SetFieldBackgroundColor(tcell.ColorNavy)
+	composeView.SetFieldBackgroundColor(s.composeFieldColor())
 	composeView.SetFieldTextColor(tcell.ColorWhite)
 	composeView.SetLabelColor(tcell.ColorWhite)
 	composeView.SetPlaceholderTextColor(tcell.ColorLightGray)
@@ -1023,6 +1034,8 @@ func (s *AppState) renderSettingsHelpItems(chatList *tview.List) {
 	chatList.Clear()
 	for _, item := range items {
 		switch item.kind {
+		case settingsItemSpacer:
+			chatList.AddItem(" ", "", 0, nil)
 		case settingsItemOpen:
 			chatList.AddItem("Open Keybindings Config", s.keybindPath+" (Enter)", 0, nil)
 		case settingsItemPreset:
@@ -1031,6 +1044,10 @@ func (s *AppState) renderSettingsHelpItems(chatList *tview.List) {
 			chatList.AddItem("Chat Text Mode", s.formatChatWrapLine()+" (Enter to toggle)", 0, nil)
 		case settingsItemWrapPct:
 			chatList.AddItem("Wrap Chars", s.formatChatWrapPctLine()+" (Enter to cycle)", 0, nil)
+		case settingsItemComposeColor:
+			chatList.AddItem("Compose Color", s.formatComposeColorLine()+" (Enter to cycle)", 0, nil)
+		case settingsItemAuthorColor:
+			chatList.AddItem("Username Color", s.formatAuthorColorLine()+" (Enter to cycle)", 0, nil)
 		case settingsItemReload:
 			chatList.AddItem("Reload Keybindings", "Reload from config file (Enter/Ctrl+R)", 0, nil)
 		case settingsItemBinding:
@@ -1048,9 +1065,14 @@ func (s *AppState) buildSettingsItems() []settingsItem {
 	return []settingsItem{
 		{kind: settingsItemOpen},
 		{kind: settingsItemPreset},
+		{kind: settingsItemSpacer},
 		{kind: settingsItemWrap},
 		{kind: settingsItemWrapPct},
+		{kind: settingsItemComposeColor},
+		{kind: settingsItemAuthorColor},
+		{kind: settingsItemSpacer},
 		{kind: settingsItemReload},
+		{kind: settingsItemSpacer},
 		{kind: settingsItemBinding, action: actionMoveDown},
 		{kind: settingsItemBinding, action: actionMoveUp},
 		{kind: settingsItemBinding, action: actionFocusCompose},
@@ -1062,6 +1084,7 @@ func (s *AppState) buildSettingsItems() []settingsItem {
 		{kind: settingsItemBinding, action: actionToggleScan},
 		{kind: settingsItemBinding, action: actionScanNow},
 		{kind: settingsItemBinding, action: actionReloadKeybinds},
+		{kind: settingsItemSpacer},
 		{kind: settingsItemInfo},
 	}
 }
@@ -1075,6 +1098,8 @@ func (s *AppState) handleSettingsSelection(index int) {
 	item := items[index]
 	composeView := s.components[ViCompose].(*tview.InputField)
 	switch item.kind {
+	case settingsItemSpacer, settingsItemInfo:
+		return
 	case settingsItemOpen:
 		err := s.openKeybindConfigInEditor()
 		if err != nil {
@@ -1127,6 +1152,18 @@ func (s *AppState) handleSettingsSelection(index int) {
 			composeView.SetTitle(s.composeTitleWithScanStatus() + " | " + s.formatChatWrapPctLine())
 			s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
 		}
+	case settingsItemComposeColor:
+		s.cycleComposeColor()
+		s.applyComposeTheme()
+		s.persistEncryptedChatSettings()
+		composeView.SetTitle(s.composeTitleWithScanStatus() + " | Compose: " + s.formatComposeColorLine())
+		s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
+	case settingsItemAuthorColor:
+		s.cycleAuthorColor()
+		s.persistEncryptedChatSettings()
+		s.rerenderActiveChatMessages()
+		composeView.SetTitle(s.composeTitleWithScanStatus() + " | Usernames: " + s.formatAuthorColorLine())
+		s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
 	case settingsItemBinding:
 		s.settingsMu.Lock()
 		s.settingsCaptureAction = item.action
@@ -1174,6 +1211,107 @@ func (s *AppState) formatActionBindingLine(action string) string {
 		return "(none)"
 	}
 	return strings.Join(keys, ", ")
+}
+
+func (s *AppState) composeFieldColor() tcell.Color {
+	s.themeMu.RLock()
+	name := s.composeColorName
+	s.themeMu.RUnlock()
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "midnight":
+		return tcell.ColorMidnightBlue
+	case "navy":
+		return tcell.ColorNavy
+	case "dark_blue":
+		return tcell.ColorDarkBlue
+	case "slate":
+		return tcell.ColorDarkSlateBlue
+	default:
+		return tcell.ColorDarkBlue
+	}
+}
+
+func (s *AppState) authorStyleTag() string {
+	s.themeMu.RLock()
+	name := strings.ToLower(strings.TrimSpace(s.authorColorName))
+	s.themeMu.RUnlock()
+	switch name {
+	case "yellow":
+		return "yellow"
+	case "green":
+		return "green"
+	case "cyan":
+		return "cyan"
+	case "white":
+		return "white"
+	case "blue":
+		return "blue"
+	default:
+		return "blue"
+	}
+}
+
+func (s *AppState) cycleComposeColor() string {
+	choices := []string{"dark_blue", "midnight", "navy", "slate"}
+	s.themeMu.Lock()
+	defer s.themeMu.Unlock()
+	current := strings.ToLower(strings.TrimSpace(s.composeColorName))
+	idx := 0
+	for i, c := range choices {
+		if c == current {
+			idx = i
+			break
+		}
+	}
+	next := choices[(idx+1)%len(choices)]
+	s.composeColorName = next
+	return next
+}
+
+func (s *AppState) cycleAuthorColor() string {
+	choices := []string{"blue", "yellow", "green", "cyan", "white"}
+	s.themeMu.Lock()
+	defer s.themeMu.Unlock()
+	current := strings.ToLower(strings.TrimSpace(s.authorColorName))
+	idx := 0
+	for i, c := range choices {
+		if c == current {
+			idx = i
+			break
+		}
+	}
+	next := choices[(idx+1)%len(choices)]
+	s.authorColorName = next
+	return next
+}
+
+func (s *AppState) formatComposeColorLine() string {
+	s.themeMu.RLock()
+	name := s.composeColorName
+	s.themeMu.RUnlock()
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func (s *AppState) formatAuthorColorLine() string {
+	s.themeMu.RLock()
+	name := s.authorColorName
+	s.themeMu.RUnlock()
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func (s *AppState) applyComposeTheme() {
+	val, ok := s.components[ViCompose]
+	if !ok {
+		return
+	}
+	input, ok := val.(*tview.InputField)
+	if !ok {
+		return
+	}
+	input.SetFieldBackgroundColor(s.composeFieldColor())
+	input.SetFieldTextColor(tcell.ColorWhite)
+	input.SetLabelColor(tcell.ColorWhite)
+	input.SetPlaceholderTextColor(tcell.ColorLightGray)
 }
 
 func (s *AppState) isChatWordWrap() bool {
@@ -2090,6 +2228,10 @@ func (s *AppState) getLocalMessageReaction(conversationID, messageID string) str
 
 func (s *AppState) formatMessageSecondary(message csa.ChatMessage, author string) string {
 	secondary := strings.TrimSpace(author)
+	if secondary == "" {
+		secondary = "Unknown"
+	}
+	secondary = fmt.Sprintf("[%s]%s[-]", s.authorStyleTag(), secondary)
 	parts := []string{}
 	for _, emotion := range message.Properties.Emotions {
 		name := strings.TrimSpace(emotion.Key)
@@ -2102,7 +2244,7 @@ func (s *AppState) formatMessageSecondary(message csa.ChatMessage, author string
 		parts = append(parts, "you:"+local)
 	}
 	if len(parts) > 0 {
-		return secondary + " | Reactions: " + strings.Join(parts, ", ")
+		return secondary + " [gray]| Reactions: " + strings.Join(parts, ", ") + "[-]"
 	}
 	return secondary
 }
@@ -3257,7 +3399,7 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 	// Clear chat
 	chatList := s.components[ViChat].(*tview.List)
 	chatList.Clear()
-	chatList.ShowSecondaryText(!s.isChatWordWrap())
+	chatList.ShowSecondaryText(true)
 	chatList.SetSelectedFunc(nil)
 	chatList.SetChangedFunc(nil)
 	s.setCurrentChatMessages(messages)
@@ -3296,16 +3438,13 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 			if len(lines) == 0 {
 				lines = []string{""}
 			}
-			header := "[deepskyblue]" + strings.TrimSpace(author) + "[-]"
-			if reactions := strings.TrimSpace(s.formatMessageReactionsOnly(message)); reactions != "" {
-				header = header + " [gray]| " + reactions + "[-]"
-			}
-			if header != "" {
-				chatList.AddItem(header, "", 0, nil)
-				rowMap = append(rowMap, msgIdx)
-			}
-			for _, line := range lines {
-				chatList.AddItem(line, "", 0, nil)
+			secondary := s.formatMessageSecondary(message, author)
+			for i, line := range lines {
+				lineSecondary := ""
+				if i == 0 {
+					lineSecondary = secondary
+				}
+				chatList.AddItem(line, lineSecondary, 0, nil)
 				rowMap = append(rowMap, msgIdx)
 			}
 		} else {
@@ -3685,6 +3824,10 @@ func (s *AppState) loadEncryptedChatSettings() error {
 		s.chatWrapChars = 80
 	}
 	s.chatWordWrapMu.Unlock()
+	s.themeMu.Lock()
+	s.composeColorName = normalizeComposeColorName(settings.ComposeColor)
+	s.authorColorName = normalizeAuthorColorName(settings.AuthorColor)
+	s.themeMu.Unlock()
 
 	return nil
 }
@@ -3725,6 +3868,10 @@ func (s *AppState) persistEncryptedChatSettings() {
 	settings.ChatWordWrap = &wrap
 	wrapChars := s.getChatWrapPercent()
 	settings.ChatWrapChars = &wrapChars
+	s.themeMu.RLock()
+	settings.ComposeColor = normalizeComposeColorName(s.composeColorName)
+	settings.AuthorColor = normalizeAuthorColorName(s.authorColorName)
+	s.themeMu.RUnlock()
 
 	plaintext, err := json.Marshal(settings)
 	if err != nil {
@@ -3881,4 +4028,22 @@ func fileExists(path string) bool {
 func commandExists(name string) bool {
 	_, err := exec.LookPath(name)
 	return err == nil
+}
+
+func normalizeComposeColorName(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "midnight", "navy", "dark_blue", "slate":
+		return strings.ToLower(strings.TrimSpace(v))
+	default:
+		return "midnight"
+	}
+}
+
+func normalizeAuthorColorName(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "blue", "yellow", "green", "cyan", "white":
+		return strings.ToLower(strings.TrimSpace(v))
+	default:
+		return "blue"
+	}
 }
