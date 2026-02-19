@@ -69,6 +69,7 @@ type AppState struct {
 
 	chatMessagesMu sync.RWMutex
 	chatMessages   []csa.ChatMessage
+	chatRowMap     []int
 
 	replyMu      sync.RWMutex
 	pendingReply *replyTarget
@@ -90,6 +91,16 @@ type AppState struct {
 	mentionCycleMu    sync.Mutex
 	mentionCycleToken string
 	mentionCycleIndex int
+	mentionCycleItems []mentionCandidate
+
+	contactsMu          sync.RWMutex
+	contactCandidates   []mentionCandidate
+	contactsLastFetched time.Time
+
+	chatWordWrapMu    sync.RWMutex
+	chatWordWrap      bool
+	chatWrapChars     int
+	chatWrapEffective int
 }
 
 type conversationRef struct {
@@ -130,6 +141,9 @@ type persistedChatSettings struct {
 	Favorites       map[string]bool   `json:"favorites"`
 	Titles          map[string]string `json:"titles"`
 	UnreadOverrides map[string]bool   `json:"unread_overrides,omitempty"`
+	ChatWordWrap    *bool             `json:"chat_word_wrap,omitempty"`
+	ChatWrapPercent *int              `json:"chat_wrap_percent,omitempty"`
+	ChatWrapChars   *int              `json:"chat_wrap_chars,omitempty"`
 }
 
 type keybindingConfigFile struct {
@@ -155,6 +169,8 @@ const (
 	settingsItemPreset  = "preset"
 	settingsItemReload  = "reload"
 	settingsItemBinding = "binding"
+	settingsItemWrap    = "chat_wrap"
+	settingsItemWrapPct = "chat_wrap_pct"
 )
 
 const (
@@ -182,6 +198,8 @@ func (s *AppState) createApp() {
 	s.unreadScanStop = make(chan struct{})
 	s.manualUnread = map[string]bool{}
 	s.messageReactions = map[string]string{}
+	s.chatWordWrap = true
+	s.chatWrapChars = 80
 	s.settingsPath, s.settingsKey = defaultSettingsPaths()
 	s.keybindPath = defaultKeybindPath()
 	s.keybindPreset = defaultKeybindPreset
@@ -273,6 +291,10 @@ func (s *AppState) createMainView() tview.Primitive {
 		SetLabel("Message: ").
 		SetPlaceholder(composeDefaultPlaceholder)
 	composeView.SetFieldWidth(0)
+	composeView.SetFieldBackgroundColor(tcell.ColorNavy)
+	composeView.SetFieldTextColor(tcell.ColorWhite)
+	composeView.SetLabelColor(tcell.ColorWhite)
+	composeView.SetPlaceholderTextColor(tcell.ColorLightGray)
 	composeView.SetBorder(true)
 	composeView.SetTitle(s.composeTitleWithScanStatus())
 	composeView.SetTitleAlign(tview.AlignCenter)
@@ -871,20 +893,23 @@ func (s *AppState) fillMainWindow() {
 			return event
 		}
 		text := composeView.GetText()
-		start, prefix, query, ok := extractTrailingMentionQuery(text)
+		trimmed := strings.TrimRight(text, " \t")
+		suffix := text[len(trimmed):]
+		start, prefix, query, ok := extractTrailingMentionQuery(trimmed)
 		if !ok {
 			s.resetMentionCycle()
 			return event
 		}
 		ids, _, _ := s.getActiveConversation()
-		suggestions := s.findMentionSuggestions(prefix, query, ids)
+		tokenKey := strings.ToLower(prefix + ":" + query)
+		suggestions, cycleKey := s.getMentionCycleSuggestions(prefix, query, tokenKey, trimmed, ids)
 		if len(suggestions) == 0 {
 			s.resetMentionCycle()
-			return event
+			composeView.SetTitle(s.composeTitleWithScanStatus() + " | No mention matches")
+			return nil
 		}
 
-		tokenKey := strings.ToLower(prefix + ":" + query)
-		nextIdx := s.nextMentionCycleIndex(tokenKey, len(suggestions), event.Key() == tcell.KeyUp)
+		nextIdx := s.nextMentionCycleIndex(cycleKey, len(suggestions), event.Key() == tcell.KeyUp)
 		if nextIdx < 0 || nextIdx >= len(suggestions) {
 			return event
 		}
@@ -896,7 +921,8 @@ func (s *AppState) fillMainWindow() {
 		if strings.TrimSpace(replacement) == strings.TrimSpace(prefix) {
 			return event
 		}
-		composeView.SetText(text[:start] + replacement)
+		composeView.SetText(trimmed[:start] + replacement + suffix)
+		s.setMentionCycleItems(cycleKey, suggestions)
 		composeView.SetTitle(s.composeTitleWithScanStatus() + " | Mention: " + selected.DisplayName)
 		return nil
 	})
@@ -1001,6 +1027,10 @@ func (s *AppState) renderSettingsHelpItems(chatList *tview.List) {
 			chatList.AddItem("Open Keybindings Config", s.keybindPath+" (Enter)", 0, nil)
 		case settingsItemPreset:
 			chatList.AddItem("Preset", s.formatPresetLine()+" (Enter to cycle)", 0, nil)
+		case settingsItemWrap:
+			chatList.AddItem("Chat Text Mode", s.formatChatWrapLine()+" (Enter to toggle)", 0, nil)
+		case settingsItemWrapPct:
+			chatList.AddItem("Wrap Chars", s.formatChatWrapPctLine()+" (Enter to cycle)", 0, nil)
 		case settingsItemReload:
 			chatList.AddItem("Reload Keybindings", "Reload from config file (Enter/Ctrl+R)", 0, nil)
 		case settingsItemBinding:
@@ -1018,6 +1048,8 @@ func (s *AppState) buildSettingsItems() []settingsItem {
 	return []settingsItem{
 		{kind: settingsItemOpen},
 		{kind: settingsItemPreset},
+		{kind: settingsItemWrap},
+		{kind: settingsItemWrapPct},
 		{kind: settingsItemReload},
 		{kind: settingsItemBinding, action: actionMoveDown},
 		{kind: settingsItemBinding, action: actionMoveUp},
@@ -1067,6 +1099,34 @@ func (s *AppState) handleSettingsSelection(index int) {
 			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Keybindings reloaded")
 		}
 		s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
+	case settingsItemWrap:
+		s.toggleChatWordWrap()
+		s.persistEncryptedChatSettings()
+		s.rerenderActiveChatMessages()
+		composeView.SetTitle(s.composeTitleWithScanStatus() + " | " + s.formatChatWrapLine())
+		s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
+	case settingsItemWrapPct:
+		next, promptCustom := s.cycleChatWrapPercent()
+		if promptCustom {
+			s.promptCustomWrapChars(func(value int, ok bool) {
+				if !ok {
+					composeView.SetTitle(s.composeTitleWithScanStatus() + " | Custom wrap canceled")
+					s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
+					return
+				}
+				s.setChatWrapChars(value)
+				s.persistEncryptedChatSettings()
+				s.rerenderActiveChatMessages()
+				composeView.SetTitle(s.composeTitleWithScanStatus() + " | " + s.formatChatWrapPctLine())
+				s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
+			})
+		} else {
+			s.setChatWrapChars(next)
+			s.persistEncryptedChatSettings()
+			s.rerenderActiveChatMessages()
+			composeView.SetTitle(s.composeTitleWithScanStatus() + " | " + s.formatChatWrapPctLine())
+			s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
+		}
 	case settingsItemBinding:
 		s.settingsMu.Lock()
 		s.settingsCaptureAction = item.action
@@ -1114,6 +1174,194 @@ func (s *AppState) formatActionBindingLine(action string) string {
 		return "(none)"
 	}
 	return strings.Join(keys, ", ")
+}
+
+func (s *AppState) isChatWordWrap() bool {
+	s.chatWordWrapMu.RLock()
+	defer s.chatWordWrapMu.RUnlock()
+	return s.chatWordWrap
+}
+
+func (s *AppState) toggleChatWordWrap() bool {
+	s.chatWordWrapMu.Lock()
+	s.chatWordWrap = !s.chatWordWrap
+	v := s.chatWordWrap
+	s.chatWordWrapMu.Unlock()
+	return v
+}
+
+func (s *AppState) formatChatWrapLine() string {
+	if s.isChatWordWrap() {
+		return "[Word Wrap] Scroll"
+	}
+	return "Word Wrap [Scroll]"
+}
+
+func (s *AppState) getChatWrapPercent() int {
+	s.chatWordWrapMu.RLock()
+	defer s.chatWordWrapMu.RUnlock()
+	if s.chatWrapChars <= 0 {
+		return 80
+	}
+	return s.chatWrapChars
+}
+
+func (s *AppState) formatChatWrapPctLine() string {
+	s.chatWordWrapMu.RLock()
+	chars := s.chatWrapChars
+	effective := s.chatWrapEffective
+	s.chatWordWrapMu.RUnlock()
+	if chars <= 0 {
+		chars = 80
+	}
+	if effective > 0 && effective != chars {
+		return fmt.Sprintf("%d chars (effective %d)", chars, effective)
+	}
+	return fmt.Sprintf("%d chars", chars)
+}
+
+func (s *AppState) cycleChatWrapPercent() (int, bool) {
+	choices := []int{20, 40, 72, 80, 100, 200, 400, 600, 800, 1000}
+	s.chatWordWrapMu.Lock()
+	defer s.chatWordWrapMu.Unlock()
+	current := s.chatWrapChars
+	if current <= 0 {
+		current = 80
+	}
+	idx := -1
+	for i, v := range choices {
+		if v == current {
+			idx = i
+			break
+		}
+	}
+	if idx == len(choices)-1 {
+		return current, true
+	}
+	if idx < 0 {
+		return choices[0], false
+	}
+	return choices[(idx+1)%len(choices)], false
+}
+
+func (s *AppState) setChatWrapChars(v int) {
+	if v < 8 {
+		v = 8
+	}
+	if v > 5000 {
+		v = 5000
+	}
+	s.chatWordWrapMu.Lock()
+	s.chatWrapChars = v
+	s.chatWordWrapMu.Unlock()
+}
+
+func (s *AppState) promptCustomWrapChars(onDone func(value int, ok bool)) {
+	defaultValue := strconv.Itoa(s.getChatWrapPercent())
+	input := tview.NewInputField().
+		SetLabel("Wrap chars: ").
+		SetText(defaultValue)
+	input.SetFieldWidth(12)
+	input.SetAcceptanceFunc(func(text string, lastChar rune) bool {
+		if lastChar == 0 {
+			return true
+		}
+		return lastChar >= '0' && lastChar <= '9'
+	})
+
+	form := tview.NewForm().
+		AddFormItem(input).
+		AddButton("Save", func() {
+			value, err := strconv.Atoi(strings.TrimSpace(input.GetText()))
+			if err != nil || value <= 0 {
+				if onDone != nil {
+					onDone(0, false)
+				}
+			} else {
+				if onDone != nil {
+					onDone(value, true)
+				}
+			}
+			s.pages.RemovePage("pageWrapCustom")
+			s.pages.SwitchToPage(PageMain)
+			if chat, ok := s.components[ViChat]; ok {
+				s.app.SetFocus(chat)
+			}
+		}).
+		AddButton("Cancel", func() {
+			if onDone != nil {
+				onDone(0, false)
+			}
+			s.pages.RemovePage("pageWrapCustom")
+			s.pages.SwitchToPage(PageMain)
+			if chat, ok := s.components[ViChat]; ok {
+				s.app.SetFocus(chat)
+			}
+		})
+	form.SetBorder(true).SetTitle("Custom Wrap Width").SetTitleAlign(tview.AlignCenter)
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(form, 7, 1, true).
+			AddItem(nil, 0, 1, false), 60, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	s.pages.AddPage("pageWrapCustom", modal, true, true)
+	s.app.SetFocus(input)
+}
+
+func (s *AppState) formatChatMessageText(content string) string {
+	txt := textMessage(content)
+	if s.isChatWordWrap() {
+		return txt
+	}
+	return strings.Join(strings.Fields(txt), " ")
+}
+
+func wrapTextLines(text string, width int) []string {
+	if strings.TrimSpace(text) == "" {
+		return []string{""}
+	}
+	if width <= 8 {
+		width = 80
+	}
+	paras := strings.Split(text, "\n")
+	lines := []string{}
+	for _, p := range paras {
+		p = strings.TrimRight(p, " \t\r")
+		if strings.TrimSpace(p) == "" {
+			lines = append(lines, "")
+			continue
+		}
+		rest := p
+		for len(rest) > 0 {
+			if len(rest) <= width {
+				lines = append(lines, rest)
+				break
+			}
+			cut := width
+			segment := rest[:cut]
+			if idx := strings.LastIndex(segment, " "); idx > 0 {
+				cut = idx
+			}
+			lines = append(lines, strings.TrimRight(rest[:cut], " "))
+			rest = strings.TrimLeft(rest[cut:], " ")
+		}
+	}
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
+}
+
+func (s *AppState) rerenderActiveChatMessages() {
+	ids, title, node := s.getActiveConversation()
+	if len(ids) == 0 {
+		return
+	}
+	go s.loadConversationsByIDs(node, ids, title)
 }
 
 func (s *AppState) isSettingsMode() bool {
@@ -1766,16 +2014,34 @@ func (s *AppState) setCurrentChatMessages(messages []csa.ChatMessage) {
 	copied := append([]csa.ChatMessage(nil), messages...)
 	s.chatMessagesMu.Lock()
 	s.chatMessages = copied
+	s.chatRowMap = nil
+	s.chatMessagesMu.Unlock()
+}
+
+func (s *AppState) setCurrentChatRowMap(rowMap []int) {
+	copied := append([]int(nil), rowMap...)
+	s.chatMessagesMu.Lock()
+	s.chatRowMap = copied
 	s.chatMessagesMu.Unlock()
 }
 
 func (s *AppState) getCurrentChatMessage(index int) (csa.ChatMessage, bool) {
 	s.chatMessagesMu.RLock()
 	defer s.chatMessagesMu.RUnlock()
-	if index < 0 || index >= len(s.chatMessages) {
+	if index < 0 {
 		return csa.ChatMessage{}, false
 	}
-	return s.chatMessages[index], true
+	messageIdx := index
+	if len(s.chatRowMap) > 0 {
+		if index >= len(s.chatRowMap) {
+			return csa.ChatMessage{}, false
+		}
+		messageIdx = s.chatRowMap[index]
+	}
+	if messageIdx < 0 || messageIdx >= len(s.chatMessages) {
+		return csa.ChatMessage{}, false
+	}
+	return s.chatMessages[messageIdx], true
 }
 
 func summarizeReplyPreview(content string) string {
@@ -1839,6 +2105,21 @@ func (s *AppState) formatMessageSecondary(message csa.ChatMessage, author string
 		return secondary + " | Reactions: " + strings.Join(parts, ", ")
 	}
 	return secondary
+}
+
+func (s *AppState) formatMessageReactionsOnly(message csa.ChatMessage) string {
+	parts := []string{}
+	for _, emotion := range message.Properties.Emotions {
+		name := strings.TrimSpace(emotion.Key)
+		if name == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s(%d)", name, len(emotion.Users)))
+	}
+	if local := s.getLocalMessageReaction(message.ConversationId, message.Id); local != "" {
+		parts = append(parts, "you:"+local)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (s *AppState) setPendingReply(reply *replyTarget) {
@@ -2012,7 +2293,7 @@ func textMessage(input string) string {
 			if strings.TrimSpace(text) == "" {
 				continue
 			}
-			output += fmt.Sprintf("\t%v\n", text)
+			output += fmt.Sprintf("%v\n", text)
 		}
 		if tt == html.ErrorToken {
 			break
@@ -2381,6 +2662,12 @@ func extractTrailingMentionQuery(text string) (start int, prefix string, query s
 	if strings.TrimSpace(text) == "" {
 		return 0, "", "", false
 	}
+	if strings.HasSuffix(text, "c@") || strings.HasSuffix(text, "C@") {
+		return len(text) - 2, "c@", "", true
+	}
+	if strings.HasSuffix(text, "@") {
+		return len(text) - 1, "@", "", true
+	}
 	end := len(text)
 	i := end - 1
 	for i >= 0 {
@@ -2461,10 +2748,80 @@ func (s *AppState) findMentionSuggestions(prefix, query string, conversationIDs 
 	return append(starts, contains...)
 }
 
+func inferMriFromMessageFrom(from string) string {
+	from = strings.TrimSpace(from)
+	if from == "" {
+		return ""
+	}
+	if strings.Contains(from, "/contacts/") {
+		parts := strings.Split(from, "/contacts/")
+		if len(parts) > 1 {
+			return strings.TrimSpace(parts[len(parts)-1])
+		}
+	}
+	return ""
+}
+
+func (s *AppState) mentionCandidatesFromCurrentMessages() []mentionCandidate {
+	s.chatMessagesMu.RLock()
+	msgs := append([]csa.ChatMessage(nil), s.chatMessages...)
+	s.chatMessagesMu.RUnlock()
+	candidates := []mentionCandidate{}
+	for _, m := range msgs {
+		name := strings.TrimSpace(m.ImDisplayName)
+		if name == "" {
+			name = inferMessageAuthor(m, s.me)
+		}
+		if isSelfDisplayName(name, s.me) || strings.EqualFold(strings.TrimSpace(name), "you") || strings.EqualFold(strings.TrimSpace(name), "unknown") {
+			continue
+		}
+		mri := inferMriFromMessageFrom(m.From)
+		objectID := ""
+		if strings.HasPrefix(strings.ToLower(mri), "8:orgid:") {
+			objectID = strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(mri), "8:orgid:"), " ")
+		}
+		candidates = append(candidates, mentionCandidate{
+			DisplayName: name,
+			Mri:         mri,
+			ObjectID:    objectID,
+		})
+	}
+	return uniqueMentions(candidates)
+}
+
 func (s *AppState) resetMentionCycle() {
 	s.mentionCycleMu.Lock()
 	s.mentionCycleToken = ""
 	s.mentionCycleIndex = -1
+	s.mentionCycleItems = nil
+	s.mentionCycleMu.Unlock()
+}
+
+func (s *AppState) getMentionCycleSuggestions(prefix, query, tokenKey, text string, conversationIDs []string) ([]mentionCandidate, string) {
+	s.mentionCycleMu.Lock()
+	defer s.mentionCycleMu.Unlock()
+
+	if len(s.mentionCycleItems) > 0 && strings.HasPrefix(s.mentionCycleToken, strings.ToLower(prefix+":")) {
+		for _, c := range s.mentionCycleItems {
+			tok := prefix + mentionTokenFromDisplayName(c.DisplayName)
+			if strings.HasSuffix(text, tok) {
+				copied := append([]mentionCandidate(nil), s.mentionCycleItems...)
+				return copied, s.mentionCycleToken
+			}
+		}
+	}
+
+	suggestions := s.findMentionSuggestions(prefix, query, conversationIDs)
+	s.mentionCycleToken = tokenKey
+	s.mentionCycleIndex = -1
+	s.mentionCycleItems = append([]mentionCandidate(nil), suggestions...)
+	return suggestions, tokenKey
+}
+
+func (s *AppState) setMentionCycleItems(tokenKey string, items []mentionCandidate) {
+	s.mentionCycleMu.Lock()
+	s.mentionCycleToken = tokenKey
+	s.mentionCycleItems = append([]mentionCandidate(nil), items...)
 	s.mentionCycleMu.Unlock()
 }
 
@@ -2536,8 +2893,12 @@ func (s *AppState) applyMentions(content string, conversationIDs []string) (stri
 		if !ok || strings.TrimSpace(candidate.DisplayName) == "" {
 			return prefixWhitespace + match
 		}
+		mri := strings.TrimSpace(candidate.Mri)
+		if mri == "" && strings.TrimSpace(candidate.ObjectID) != "" {
+			mri = "8:orgid:" + strings.TrimSpace(candidate.ObjectID)
+		}
 
-		key := strings.ToLower(strings.TrimSpace(candidate.DisplayName)) + "|" + strings.ToLower(strings.TrimSpace(candidate.Mri))
+		key := strings.ToLower(strings.TrimSpace(candidate.DisplayName)) + "|" + strings.ToLower(strings.TrimSpace(mri))
 		mentionID, exists := seenKeyToID[key]
 		if !exists {
 			mentionID = len(mentions)
@@ -2545,12 +2906,12 @@ func (s *AppState) applyMentions(content string, conversationIDs []string) (stri
 			mentions = append(mentions, mentionWire{
 				ID:          mentionID,
 				MentionType: "person",
-				Mri:         strings.TrimSpace(candidate.Mri),
+				Mri:         mri,
 				DisplayName: strings.TrimSpace(candidate.DisplayName),
 				ObjectId:    strings.TrimSpace(candidate.ObjectID),
 			})
 		}
-		return prefixWhitespace + fmt.Sprintf("<at id=\"%d\">%s</at>", mentionID, candidate.DisplayName)
+		return prefixWhitespace + fmt.Sprintf("<at id=\"%d\">@%s</at>", mentionID, candidate.DisplayName)
 	})
 
 	return out, mentions
@@ -2580,6 +2941,9 @@ func mentionKey(c mentionCandidate) string {
 	name := strings.ToLower(strings.TrimSpace(c.DisplayName))
 	mri := strings.ToLower(strings.TrimSpace(c.Mri))
 	obj := strings.ToLower(strings.TrimSpace(c.ObjectID))
+	if mri == "" && obj != "" {
+		mri = "8:orgid:" + obj
+	}
 	if name == "" {
 		return ""
 	}
@@ -2611,7 +2975,7 @@ func uniqueMentions(in []mentionCandidate) []mentionCandidate {
 
 func (s *AppState) mentionCandidatesForConversation(conversationIDs []string) []mentionCandidate {
 	if s.conversations == nil {
-		return nil
+		return s.mentionCandidatesFromCurrentMessages()
 	}
 	ids := map[string]struct{}{}
 	for _, id := range conversationIDs {
@@ -2625,9 +2989,16 @@ func (s *AppState) mentionCandidatesForConversation(conversationIDs []string) []
 	}
 
 	candidates := []mentionCandidate{}
+	candidates = append(candidates, s.mentionCandidatesFromCurrentMessages()...)
 	for _, chat := range s.conversations.Chats {
-		chatID := normalizeFavoriteKey(chat.Id)
-		if _, ok := ids[chatID]; !ok {
+		matched := false
+		for _, cid := range candidateConversationIds(chat, s.conversations.PrivateFeeds) {
+			if _, ok := ids[normalizeFavoriteKey(cid)]; ok {
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			continue
 		}
 		for _, member := range chat.Members {
@@ -2649,10 +3020,12 @@ func (s *AppState) mentionCandidatesForConversation(conversationIDs []string) []
 }
 
 func (s *AppState) mentionCandidatesGlobal() []mentionCandidate {
-	if s.conversations == nil {
-		return nil
-	}
 	candidates := []mentionCandidate{}
+	candidates = append(candidates, s.getContactCandidates()...)
+	candidates = append(candidates, s.mentionCandidatesFromCurrentMessages()...)
+	if s.conversations == nil {
+		return uniqueMentions(candidates)
+	}
 	for _, chat := range s.conversations.Chats {
 		for _, member := range chat.Members {
 			if isCurrentUser(member, s.me) {
@@ -2670,6 +3043,111 @@ func (s *AppState) mentionCandidatesGlobal() []mentionCandidate {
 		}
 	}
 	return uniqueMentions(candidates)
+}
+
+func (s *AppState) getContactCandidates() []mentionCandidate {
+	s.contactsMu.RLock()
+	if time.Since(s.contactsLastFetched) < 10*time.Minute && len(s.contactCandidates) > 0 {
+		cached := append([]mentionCandidate(nil), s.contactCandidates...)
+		s.contactsMu.RUnlock()
+		return cached
+	}
+	s.contactsMu.RUnlock()
+
+	fresh, err := s.fetchContactCandidatesFromAPI()
+	if err != nil {
+		s.logger.WithError(err).Debug("contacts endpoint unavailable; using fallback participants")
+		return nil
+	}
+	fresh = uniqueMentions(fresh)
+	s.contactsMu.Lock()
+	s.contactCandidates = append([]mentionCandidate(nil), fresh...)
+	s.contactsLastFetched = time.Now()
+	s.contactsMu.Unlock()
+	return fresh
+}
+
+func (s *AppState) fetchContactCandidatesFromAPI() ([]mentionCandidate, error) {
+	endpoints := []string{
+		csa.MessagesHost + "v1/users/ME/contacts",
+		csa.MessagesHost + "v1/users/ME/people",
+		"https://teams.microsoft.com/api/mt/part/emea-02/beta/users/people",
+	}
+	var lastErr error
+	for _, ep := range endpoints {
+		req, err := s.teamsClient.ChatSvc().AuthenticatedRequest(http.MethodGet, ep, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("contacts endpoint %s status=%d", ep, resp.StatusCode)
+			continue
+		}
+		candidates := extractMentionCandidatesFromJSON(body)
+		if len(candidates) > 0 {
+			return candidates, nil
+		}
+		lastErr = fmt.Errorf("contacts endpoint %s returned no candidates", ep)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no contacts endpoint succeeded")
+	}
+	return nil, lastErr
+}
+
+func extractMentionCandidatesFromJSON(data []byte) []mentionCandidate {
+	var raw interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	out := []mentionCandidate{}
+	var walk func(v interface{})
+	walk = func(v interface{}) {
+		switch t := v.(type) {
+		case map[string]interface{}:
+			name := firstString(t, "displayName", "friendlyName", "name")
+			mri := firstString(t, "mri", "id")
+			objectID := firstString(t, "objectId", "oid")
+			if strings.TrimSpace(name) != "" {
+				out = append(out, mentionCandidate{
+					DisplayName: strings.TrimSpace(name),
+					Mri:         strings.TrimSpace(mri),
+					ObjectID:    strings.TrimSpace(objectID),
+				})
+			}
+			for _, v2 := range t {
+				walk(v2)
+			}
+		case []interface{}:
+			for _, v2 := range t {
+				walk(v2)
+			}
+		}
+	}
+	walk(raw)
+	return out
+}
+
+func firstString(m map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			if s, ok := v.(string); ok {
+				s = strings.TrimSpace(s)
+				if s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func (s *AppState) fetchConversationMessages(displayName string, conversationIDs []string) ([]string, []csa.ChatMessage, error) {
@@ -2779,20 +3257,63 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 	// Clear chat
 	chatList := s.components[ViChat].(*tview.List)
 	chatList.Clear()
+	chatList.ShowSecondaryText(!s.isChatWordWrap())
 	chatList.SetSelectedFunc(nil)
 	chatList.SetChangedFunc(nil)
 	s.setCurrentChatMessages(messages)
+	rowMap := []int{}
 	s.logger.WithFields(logrus.Fields{
 		"display_name":   displayName,
 		"messages_count": len(messages),
 	}).Debug("rendering messages")
-	for _, message := range messages {
+	_, _, listWidth, _ := chatList.GetRect()
+	_, _, _, innerWidth := chatList.GetInnerRect()
+	if listWidth > 2 {
+		if listWidth-2 > innerWidth {
+			innerWidth = listWidth - 2
+		}
+	}
+	if innerWidth <= 0 {
+		innerWidth = 80
+	}
+	wrapWidth := s.getChatWrapPercent()
+	if wrapWidth > innerWidth {
+		wrapWidth = innerWidth
+	}
+	if wrapWidth < 8 {
+		wrapWidth = 8
+	}
+	s.chatWordWrapMu.Lock()
+	s.chatWrapEffective = wrapWidth
+	s.chatWordWrapMu.Unlock()
+	for msgIdx, message := range messages {
 		author := strings.TrimSpace(message.ImDisplayName)
 		if author == "" {
 			author = inferMessageAuthor(message, s.me)
 		}
-		chatList.AddItem(textMessage(message.Content), s.formatMessageSecondary(message, author), 0, nil)
+		if s.isChatWordWrap() {
+			lines := wrapTextLines(textMessage(message.Content), wrapWidth)
+			if len(lines) == 0 {
+				lines = []string{""}
+			}
+			header := "[deepskyblue]" + strings.TrimSpace(author) + "[-]"
+			if reactions := strings.TrimSpace(s.formatMessageReactionsOnly(message)); reactions != "" {
+				header = header + " [gray]| " + reactions + "[-]"
+			}
+			if header != "" {
+				chatList.AddItem(header, "", 0, nil)
+				rowMap = append(rowMap, msgIdx)
+			}
+			for _, line := range lines {
+				chatList.AddItem(line, "", 0, nil)
+				rowMap = append(rowMap, msgIdx)
+			}
+		} else {
+			chatList.AddItem(s.formatChatMessageText(message.Content), s.formatMessageSecondary(message, author), 0, nil)
+			rowMap = append(rowMap, msgIdx)
+		}
 	}
+	s.setCurrentChatRowMap(rowMap)
 	if chatList.GetItemCount() > 0 {
 		chatList.SetCurrentItem(chatList.GetItemCount() - 1)
 	}
@@ -3149,6 +3670,22 @@ func (s *AppState) loadEncryptedChatSettings() error {
 	}
 	s.manualUnreadMu.Unlock()
 
+	s.chatWordWrapMu.Lock()
+	if settings.ChatWordWrap == nil {
+		s.chatWordWrap = true
+	} else {
+		s.chatWordWrap = *settings.ChatWordWrap
+	}
+	if settings.ChatWrapChars != nil && *settings.ChatWrapChars > 0 {
+		s.chatWrapChars = *settings.ChatWrapChars
+	} else if settings.ChatWrapPercent != nil && *settings.ChatWrapPercent > 0 {
+		// Backward compatibility with previous percent-based setting.
+		s.chatWrapChars = *settings.ChatWrapPercent
+	} else {
+		s.chatWrapChars = 80
+	}
+	s.chatWordWrapMu.Unlock()
+
 	return nil
 }
 
@@ -3184,6 +3721,10 @@ func (s *AppState) persistEncryptedChatSettings() {
 		settings.UnreadOverrides[k] = v
 	}
 	s.manualUnreadMu.RUnlock()
+	wrap := s.isChatWordWrap()
+	settings.ChatWordWrap = &wrap
+	wrapChars := s.getChatWrapPercent()
+	settings.ChatWrapChars = &wrapChars
 
 	plaintext, err := json.Marshal(settings)
 	if err != nil {

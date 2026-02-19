@@ -91,6 +91,11 @@ If a `401` still reaches the error page, a `Run teams-token` button appears for 
   - Enter on preset row cycles `default -> vim -> emacs -> jk`
   - Enter on binding row captures a new single key
   - `Esc` while capturing resets that action to preset default
+- Chat text mode toggle in `Settings & Help`:
+  - `Word Wrap` (default)
+  - `Scroll` (single-line messages)
+  - configurable wrap characters (`20/40/72/80/100/200/400/600/800/1000/custom`)
+  - actual visible wrap is capped by current chat pane width
 - Message reactions display in chat (`Reactions: ...`)
 - Quick react hotkey in chat (`e` adds 👍 to selected message, server + local fallback)
 - Reply mode in chat (`r` replies to selected message)
@@ -98,6 +103,7 @@ If a `401` still reaches the error page, a `Run teams-token` button appears for 
   - `@name` prefers current chat members, then global contacts
   - `c@name` forces global contacts lookup
   - while typing mention token, use `Up/Down` in compose to cycle suggestions and prefill
+  - posted mentions keep `@` prefix
 - Custom keybindings via config file: `~/.config/fossteams/teams-cli-keybindings.json`
 - Keybinding presets: `default`, `vim`, `emacs`, `jk`
 - Encrypted persistence of:
