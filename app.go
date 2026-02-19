@@ -16,6 +16,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -39,6 +42,8 @@ type AppState struct {
 
 	chatFavoritesMu sync.RWMutex
 	chatFavorites   map[string]bool
+
+	authRefreshMu sync.Mutex
 }
 
 type conversationRef struct {
@@ -992,38 +997,59 @@ func (s *AppState) sendMessage(conversationIDs []string, content string) error {
 
 	var lastErr error
 	for _, id := range ids {
-		endpoint := csa.MessagesHost + "v1/users/ME/conversations/" + url.QueryEscape(id) + "/messages"
-		req, err := s.teamsClient.ChatSvc().AuthenticatedRequest(http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Add("Content-Type", "application/json")
+		for attempt := 0; attempt < 2; attempt++ {
+			endpoint := csa.MessagesHost + "v1/users/ME/conversations/" + url.QueryEscape(id) + "/messages"
+			req, err := s.teamsClient.ChatSvc().AuthenticatedRequest(http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+			if err != nil {
+				if attempt == 0 && isUnauthorizedError(err) {
+					if refreshErr := s.refreshAuthFromTeamsToken(); refreshErr == nil {
+						continue
+					} else {
+						lastErr = fmt.Errorf("unauthorized and unable to refresh auth: %v", refreshErr)
+						break
+					}
+				}
+				lastErr = err
+				break
+			}
+			req.Header.Add("Content-Type", "application/json")
 
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				lastErr = err
+				break
+			}
 
-		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-			_, _ = io.ReadAll(resp.Body)
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+				_, _ = io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				s.logger.WithFields(logrus.Fields{
+					"conversation_id": id,
+					"status_code":     resp.StatusCode,
+				}).Info("message sent")
+				return nil
+			}
+			if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
+				_, _ = io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if refreshErr := s.refreshAuthFromTeamsToken(); refreshErr == nil {
+					continue
+				} else {
+					lastErr = fmt.Errorf("send unauthorized for %s and refresh failed: %v", id, refreshErr)
+					break
+				}
+			}
+
+			body, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("send failed for %s: status=%d body=%s", id, resp.StatusCode, strings.TrimSpace(string(body)))
 			s.logger.WithFields(logrus.Fields{
 				"conversation_id": id,
 				"status_code":     resp.StatusCode,
-			}).Info("message sent")
-			return nil
+				"response_body":   strings.TrimSpace(string(body)),
+			}).Warn("message send failed for conversation id")
+			break
 		}
-
-		body, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		lastErr = fmt.Errorf("send failed for %s: status=%d body=%s", id, resp.StatusCode, strings.TrimSpace(string(body)))
-		s.logger.WithFields(logrus.Fields{
-			"conversation_id": id,
-			"status_code":     resp.StatusCode,
-			"response_body":   strings.TrimSpace(string(body)),
-		}).Warn("message send failed for conversation id")
 	}
 
 	if lastErr == nil {
@@ -1063,14 +1089,31 @@ func (s *AppState) fetchConversationMessages(displayName string, conversationIDs
 			"conversation_id": id,
 			"attempt":         strconv.Itoa(idx + 1),
 		}).Debug("fetching messages")
-		messages, err = s.teamsClient.GetMessages(&csa.Channel{Id: id, DisplayName: displayName})
+		for attempt := 0; attempt < 2; attempt++ {
+			messages, err = s.teamsClient.GetMessages(&csa.Channel{Id: id, DisplayName: displayName})
+			if err == nil {
+				s.logger.WithFields(logrus.Fields{
+					"display_name":    displayName,
+					"conversation_id": id,
+					"attempt":         strconv.Itoa(idx + 1),
+					"messages_count":  len(messages),
+				}).Info("messages loaded")
+				break
+			}
+			if attempt == 0 && isUnauthorizedError(err) {
+				refreshErr := s.refreshAuthFromTeamsToken()
+				if refreshErr == nil {
+					continue
+				}
+				s.logger.WithFields(logrus.Fields{
+					"display_name":    displayName,
+					"conversation_id": id,
+					"refresh_error":   refreshErr.Error(),
+				}).Warn("unable to refresh auth after unauthorized response")
+			}
+			break
+		}
 		if err == nil {
-			s.logger.WithFields(logrus.Fields{
-				"display_name":    displayName,
-				"conversation_id": id,
-				"attempt":         strconv.Itoa(idx + 1),
-				"messages_count":  len(messages),
-			}).Info("messages loaded")
 			break
 		}
 		s.logger.WithFields(logrus.Fields{
@@ -1168,4 +1211,49 @@ func inferMessageAuthor(message csa.ChatMessage, me *models.User) string {
 		}
 	}
 	return "Unknown"
+}
+
+func isUnauthorizedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(lower, "401") || strings.Contains(lower, "unauthorized")
+}
+
+func (s *AppState) refreshAuthFromTeamsToken() error {
+	s.authRefreshMu.Lock()
+	defer s.authRefreshMu.Unlock()
+
+	teamsTokenDir := "teams-token"
+	info, err := os.Stat(teamsTokenDir)
+	if err != nil || !info.IsDir() {
+		return fmt.Errorf("optional %s directory not found", teamsTokenDir)
+	}
+
+	var cmd *exec.Cmd
+	binaryPath := filepath.Join(teamsTokenDir, "teams-token")
+	if binaryInfo, statErr := os.Stat(binaryPath); statErr == nil && !binaryInfo.IsDir() && binaryInfo.Mode()&0o111 != 0 {
+		cmd = exec.Command("./teams-token")
+		cmd.Dir = teamsTokenDir
+	} else {
+		if _, statErr = os.Stat(filepath.Join(teamsTokenDir, "go.mod")); statErr != nil {
+			return fmt.Errorf("%s exists but has no teams-token binary or go.mod", teamsTokenDir)
+		}
+		cmd = exec.Command("go", "run", ".")
+		cmd.Dir = teamsTokenDir
+	}
+
+	output, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		return fmt.Errorf("teams-token refresh command failed: %v (output: %s)", runErr, strings.TrimSpace(string(output)))
+	}
+	s.logger.Info("teams-token refresh command succeeded")
+
+	newClient, newClientErr := teams_api.New()
+	if newClientErr != nil {
+		return fmt.Errorf("unable to reinitialize Teams client after token refresh: %v", newClientErr)
+	}
+	s.teamsClient = newClient
+	return nil
 }

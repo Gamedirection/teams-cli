@@ -1,0 +1,3 @@
+[submodule "teams-token"]
+	path = teams-token
+	url = https://github.com/fossteams/teams-token.git
