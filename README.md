@@ -75,6 +75,21 @@ On `401`, teams-cli will try to run `teams-token` using:
 
 If a `401` still reaches the error page, a `Run teams-token` button appears for manual refresh.
 
+## Terminal Auth Attempts (Feb 2026)
+
+We explored "all-in-terminal" auth alternatives and recorded the outcomes:
+
+- **Device Code Flow**: Rejected by Azure AD for the Teams client ID (`5e3ce6c0-2b1f-4285-8d4b-75ee78787346`). Error: `AADSTS70002` (“client must be marked as mobile/public”).
+- **term.everything + Xwayland**: Electron consistently aborted (futex/SIGABRT) even with sandbox disabled and GPU/dev-shm flags.
+- **term.everything + Wayland/Ozone**: Electron failed to initialize Wayland and, in some runs, hit OOM during startup.
+
+### Suggestions For A Terminal-Only Path
+
+1. **Use a device-code-capable client ID**: Register or reuse an Azure AD public client that allows device code. Parameterize the client ID and tenant.
+2. **Headless auth helper**: A small CLI that implements device code or PKCE and writes `~/.config/fossteams/token-*.jwt` directly could fully replace Electron.
+3. **Token broker**: Run auth in a browser elsewhere and exchange a short-lived code for tokens via a secure local channel.
+4. **Fallback-friendly UX**: Keep terminal-first attempts, but auto-fallback to browser/Electron with a clear reason and next steps.
+
 ## Features
 
 - Teams + channels listing
