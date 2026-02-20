@@ -1,3 +1,6 @@
 [submodule "teams-token"]
 	path = teams-token
 	url = https://github.com/fossteams/teams-token.git
+[submodule "teams-token-cli"]
+	path = teams-token-cli
+	url = https://github.com/Gamedirection/teams-token-cli.git
