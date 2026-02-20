@@ -454,9 +454,10 @@ func (s *AppState) showError(err error) {
 	val.(*tview.TextView).SetText(err.Error())
 
 	is401 := isUnauthorizedError(err)
+	needsAuth := is401 || isAuthMissingError(err)
 	if body, ok := s.components[FlErrorBody].(*tview.Flex); ok {
 		if action, ok := s.components[FlErrorAction]; ok {
-			if is401 {
+			if needsAuth {
 				body.ResizeItem(action, 3, 0)
 			} else {
 				body.ResizeItem(action, 0, 0)
@@ -464,7 +465,7 @@ func (s *AppState) showError(err error) {
 		}
 	}
 	s.pages.SwitchToPage(PageError)
-	if is401 {
+	if needsAuth {
 		if btn, ok := s.components[BtErrorAuth].(*tview.Button); ok {
 			s.app.SetFocus(btn)
 		}
@@ -481,11 +482,16 @@ func (s *AppState) createErrorView() tview.Primitive {
 	p.SetBorder(true)
 	p.SetBorderPadding(1, 1, 1, 1)
 
-	authButton := tview.NewButton("Run teams-token")
+	authButton := tview.NewButton("Run auth refresh")
 	authButton.SetSelectedFunc(func() {
 		go func() {
+			termNote := termEverythingNote()
 			s.app.QueueUpdateDraw(func() {
-				p.SetText("Refreshing auth by running ./teams-token ...")
+				if termNote == "" {
+					p.SetText("Refreshing auth...")
+					return
+				}
+				p.SetText(fmt.Sprintf("Refreshing auth... (%s)", termNote))
 			})
 			err := s.refreshAuthFromTeamsToken()
 			s.app.QueueUpdateDraw(func() {
@@ -3956,61 +3962,86 @@ func isUnauthorizedError(err error) bool {
 	return strings.Contains(lower, "401") || strings.Contains(lower, "unauthorized")
 }
 
+func isAuthMissingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(lower, "token-") && strings.Contains(lower, ".jwt") {
+		return true
+	}
+	if strings.Contains(lower, "fossteams") && strings.Contains(lower, "no such file") {
+		return true
+	}
+	if strings.Contains(lower, "skypespaces token") && strings.Contains(lower, "no such file") {
+		return true
+	}
+	return false
+}
+
 func (s *AppState) refreshAuthFromTeamsToken() error {
 	s.authRefreshMu.Lock()
 	defer s.authRefreshMu.Unlock()
 
-	teamsTokenDir := "teams-token"
-	info, err := os.Stat(teamsTokenDir)
-	if err != nil || !info.IsDir() {
-		return fmt.Errorf("optional %s directory not found", teamsTokenDir)
+	deviceErr := error(nil)
+	if err := s.refreshAuthFromDeviceCode(); err == nil {
+		s.logger.Info("device code auth refresh succeeded")
+		newClient, newClientErr := teams_api.New()
+		if newClientErr != nil {
+			return fmt.Errorf("unable to reinitialize Teams client after token refresh: %v", newClientErr)
+		}
+		s.teamsClient = newClient
+		return nil
+	} else {
+		deviceErr = err
+		s.logger.WithError(err).Warn("device code auth refresh failed, falling back")
 	}
 
-	var cmd *exec.Cmd
-	binaryPath := filepath.Join(teamsTokenDir, "teams-token")
-	if binaryInfo, statErr := os.Stat(binaryPath); statErr == nil && !binaryInfo.IsDir() && binaryInfo.Mode()&0o111 != 0 {
-		cmd = exec.Command("./teams-token")
-		cmd.Dir = teamsTokenDir
+	teamsTokenDir, err := findTeamsTokenDir()
+	if err != nil {
+		return err
+	}
+
+	runCmd, runCmdStr, err := buildTeamsTokenCommand(teamsTokenDir)
+	if err != nil {
+		return err
+	}
+
+	cmd := runCmd
+	interactive := false
+	if wrapped, ok, note, wrapErr := wrapWithTermEverything(runCmdStr, teamsTokenDir); wrapErr != nil {
+		return wrapErr
+	} else if ok {
+		cmd = wrapped
+		interactive = true
+		if note != "" {
+			s.logger.WithField("term_everything", note).Info("auth refresh using term.everything")
+		}
+	} else if note != "" {
+		s.logger.WithField("term_everything", note).Info("auth refresh without term.everything")
+	}
+
+	if interactive {
+		var runErr error
+		s.app.Suspend(func() {
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			runErr = cmd.Run()
+		})
+		if runErr != nil {
+			return fmt.Errorf("auth refresh command failed: %v", runErr)
+		}
 	} else {
-		if _, statErr = os.Stat(filepath.Join(teamsTokenDir, "go.mod")); statErr == nil {
-			cmd = exec.Command("go", "run", ".")
-			cmd.Dir = teamsTokenDir
-		} else if _, statErr = os.Stat(filepath.Join(teamsTokenDir, "package.json")); statErr == nil {
-			if hasYarnLock := fileExists(filepath.Join(teamsTokenDir, "yarn.lock")); hasYarnLock && commandExists("yarn") {
-				if !fileExists(filepath.Join(teamsTokenDir, "node_modules")) {
-					installCmd := exec.Command("yarn", "install")
-					installCmd.Dir = teamsTokenDir
-					installOutput, installErr := installCmd.CombinedOutput()
-					if installErr != nil {
-						return fmt.Errorf("teams-token yarn install failed: %v (output: %s)", installErr, strings.TrimSpace(string(installOutput)))
-					}
-				}
-				cmd = exec.Command("yarn", "start")
-				cmd.Dir = teamsTokenDir
-			} else if commandExists("npm") {
-				if !fileExists(filepath.Join(teamsTokenDir, "node_modules")) {
-					installCmd := exec.Command("npm", "install", "--no-audit", "--no-fund")
-					installCmd.Dir = teamsTokenDir
-					installOutput, installErr := installCmd.CombinedOutput()
-					if installErr != nil {
-						return fmt.Errorf("teams-token npm install failed: %v (output: %s)", installErr, strings.TrimSpace(string(installOutput)))
-					}
-				}
-				cmd = exec.Command("npm", "run", "start")
-				cmd.Dir = teamsTokenDir
-			} else {
-				return fmt.Errorf("%s is a Node project, but neither yarn nor npm is installed", teamsTokenDir)
+		output, runErr := cmd.CombinedOutput()
+		if runErr != nil {
+			if deviceErr != nil {
+				return fmt.Errorf("device code auth failed: %v; electron auth failed: %v (output: %s)", deviceErr, runErr, strings.TrimSpace(string(output)))
 			}
-		} else {
-			return fmt.Errorf("%s exists but has no supported runner (binary/go.mod/package.json)", teamsTokenDir)
+			return fmt.Errorf("auth refresh command failed: %v (output: %s)", runErr, strings.TrimSpace(string(output)))
 		}
 	}
-
-	output, runErr := cmd.CombinedOutput()
-	if runErr != nil {
-		return fmt.Errorf("teams-token refresh command failed: %v (output: %s)", runErr, strings.TrimSpace(string(output)))
-	}
-	s.logger.Info("teams-token refresh command succeeded")
+	s.logger.Info("auth refresh command succeeded")
 
 	newClient, newClientErr := teams_api.New()
 	if newClientErr != nil {
@@ -4018,6 +4049,317 @@ func (s *AppState) refreshAuthFromTeamsToken() error {
 	}
 	s.teamsClient = newClient
 	return nil
+}
+
+func findTeamsTokenDir() (string, error) {
+	candidates := []string{"teams-token", "teams-token-cli"}
+	searchRoots := candidateSearchRoots()
+	for _, root := range searchRoots {
+		for _, candidate := range candidates {
+			path := filepath.Join(root, candidate)
+			info, err := os.Stat(path)
+			if err == nil && info.IsDir() {
+				return path, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no teams-token directory found (checked %s)", strings.Join(candidates, ", "))
+}
+
+func buildTeamsTokenCommand(teamsTokenDir string) (*exec.Cmd, string, error) {
+	binaryPath := filepath.Join(teamsTokenDir, "teams-token")
+	if binaryInfo, statErr := os.Stat(binaryPath); statErr == nil && !binaryInfo.IsDir() && binaryInfo.Mode()&0o111 != 0 {
+		cmd := exec.Command("./teams-token")
+		cmd.Dir = teamsTokenDir
+		return cmd, "./teams-token", nil
+	}
+
+	if _, statErr := os.Stat(filepath.Join(teamsTokenDir, "go.mod")); statErr == nil {
+		cmd := exec.Command("go", "run", ".")
+		cmd.Dir = teamsTokenDir
+		return cmd, "go run .", nil
+	}
+
+	if _, statErr := os.Stat(filepath.Join(teamsTokenDir, "package.json")); statErr == nil {
+		if hasYarnLock := fileExists(filepath.Join(teamsTokenDir, "yarn.lock")); hasYarnLock && commandExists("yarn") {
+			if !fileExists(filepath.Join(teamsTokenDir, "node_modules")) {
+				installCmd := exec.Command("yarn", "install")
+				installCmd.Dir = teamsTokenDir
+				installOutput, installErr := installCmd.CombinedOutput()
+				if installErr != nil {
+					return nil, "", fmt.Errorf("teams-token yarn install failed: %v (output: %s)", installErr, strings.TrimSpace(string(installOutput)))
+				}
+			}
+			return buildElectronNodeCommand(teamsTokenDir), electronNodeCommandString(teamsTokenDir), nil
+		}
+
+		if commandExists("npm") {
+			if !fileExists(filepath.Join(teamsTokenDir, "node_modules")) {
+				installCmd := exec.Command("npm", "install", "--no-audit", "--no-fund")
+				installCmd.Dir = teamsTokenDir
+				installOutput, installErr := installCmd.CombinedOutput()
+				if installErr != nil {
+					return nil, "", fmt.Errorf("teams-token npm install failed: %v (output: %s)", installErr, strings.TrimSpace(string(installOutput)))
+				}
+			}
+			return buildElectronNodeCommand(teamsTokenDir), electronNodeCommandString(teamsTokenDir), nil
+		}
+		return nil, "", fmt.Errorf("%s is a Node project, but neither yarn nor npm is installed", teamsTokenDir)
+	}
+
+	return nil, "", fmt.Errorf("%s exists but has no supported runner (binary/go.mod/package.json)", teamsTokenDir)
+}
+
+func buildElectronNodeCommand(teamsTokenDir string) *exec.Cmd {
+	cmd := exec.Command("bash", "-lc", electronNodeCommandString(teamsTokenDir))
+	cmd.Dir = teamsTokenDir
+	return cmd
+}
+
+func electronNodeCommandString(teamsTokenDir string) string {
+	electronBin := filepath.Join(teamsTokenDir, "node_modules", ".bin", "electron")
+	electronFlags := []string{
+		"--no-sandbox",
+		"--disable-setuid-sandbox",
+		"--disable-seccomp-filter-sandbox",
+		"--disable-gpu",
+		"--disable-dev-shm-usage",
+	}
+	electronEnv := "ELECTRON_DISABLE_SANDBOX=1"
+	if useWaylandNativeElectron() {
+		electronFlags = append(electronFlags, "--enable-features=UseOzonePlatform", "--ozone-platform=wayland")
+		electronEnv = "ELECTRON_DISABLE_SANDBOX=1 ELECTRON_OZONE_PLATFORM_HINT=wayland"
+	}
+	return strings.Join([]string{
+		"yarn run build",
+		fmt.Sprintf("%s %s %s ./dist/main.js", electronEnv, shQuote(electronBin), strings.Join(electronFlags, " ")),
+	}, " && ")
+}
+
+func wrapWithTermEverything(cmdStr string, teamsTokenDir string) (*exec.Cmd, bool, string, error) {
+	decision := decideTermEverything()
+	if decision.err != nil {
+		return nil, false, decision.note, decision.err
+	}
+	if !decision.use {
+		return nil, false, decision.note, nil
+	}
+
+	runCmd := fmt.Sprintf("cd %s && %s", shQuote(teamsTokenDir), cmdStr)
+	wrappedCmd := runCmd
+	if !useWaylandNativeElectron() {
+		var wrapErr error
+		wrappedCmd, wrapErr = wrapWithXwayland(runCmd)
+		if wrapErr != nil {
+			return nil, false, decision.note, wrapErr
+		}
+	} else {
+		wrappedCmd = wrapWithLogging(runCmd)
+	}
+
+	if decision.binPath != "" {
+		return exec.Command(decision.binPath, "--support-old-apps", "--", wrappedCmd), true, decision.note, nil
+	}
+
+	cmd := exec.Command("go", "run", ".", "--support-old-apps", "--", wrappedCmd)
+	cmd.Dir = decision.termEverythingDir
+	return cmd, true, decision.note, nil
+}
+
+func useWaylandNativeElectron() bool {
+	val := strings.ToLower(strings.TrimSpace(os.Getenv("TEAMS_CLI_ELECTRON_OZONE")))
+	return val == "1" || val == "true" || val == "yes"
+}
+
+type termEverythingDecision struct {
+	note              string
+	use               bool
+	err               error
+	binPath           string
+	termEverythingDir string
+}
+
+func decideTermEverything() termEverythingDecision {
+	termEverythingDir := findTermEverythingDir()
+	if disableTermEverything() {
+		return termEverythingDecision{note: "term.everything disabled", use: false, termEverythingDir: termEverythingDir}
+	}
+
+	if termEverythingDir == "" {
+		return termEverythingDecision{note: "term.everything not found", use: false, termEverythingDir: "term.everything"}
+	}
+
+	if binPath := findTermEverythingBinary(termEverythingDir); binPath != "" {
+		return termEverythingDecision{
+			note:              "term.everything enabled (binary)",
+			use:               true,
+			binPath:           binPath,
+			termEverythingDir: termEverythingDir,
+		}
+	}
+
+	if commandExists("go") {
+		return termEverythingDecision{
+			note:              "term.everything enabled (go run)",
+			use:               true,
+			termEverythingDir: termEverythingDir,
+		}
+	}
+
+	return termEverythingDecision{
+		note:              "term.everything unavailable (no binary and Go missing)",
+		use:               false,
+		err:               fmt.Errorf("term.everything is present but no runnable binary found and Go is not installed"),
+		termEverythingDir: termEverythingDir,
+	}
+}
+
+func termEverythingNote() string {
+	return decideTermEverything().note
+}
+
+func candidateSearchRoots() []string {
+	roots := []string{}
+	if wd, err := os.Getwd(); err == nil && wd != "" {
+		roots = append(roots, wd)
+	}
+	if exeDir := executableDir(); exeDir != "" {
+		roots = append(roots, exeDir)
+	}
+	if repoRoot := findRepoRoot(roots); repoRoot != "" {
+		roots = append(roots, repoRoot)
+	}
+	return uniqStrings(roots)
+}
+
+func findTermEverythingDir() string {
+	searchRoots := candidateSearchRoots()
+	for _, root := range searchRoots {
+		path := filepath.Join(root, "term.everything")
+		info, err := os.Stat(path)
+		if err == nil && info.IsDir() {
+			return path
+		}
+	}
+	return ""
+}
+
+func executableDir() string {
+	exe, err := os.Executable()
+	if err != nil || exe == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil && resolved != "" {
+		exe = resolved
+	}
+	return filepath.Dir(exe)
+}
+
+func findRepoRoot(candidates []string) string {
+	for _, start := range candidates {
+		for dir := start; dir != "" && dir != "/"; dir = filepath.Dir(dir) {
+			if fileExists(filepath.Join(dir, ".gitmodules")) {
+				return dir
+			}
+		}
+	}
+	return ""
+}
+
+func uniqStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func disableTermEverything() bool {
+	val := strings.ToLower(strings.TrimSpace(os.Getenv("TEAMS_CLI_DISABLE_TERM_EVERYTHING")))
+	return val == "1" || val == "true" || val == "yes"
+}
+
+func findTermEverythingBinary(termEverythingDir string) string {
+	pattern := filepath.Join(termEverythingDir, "dist", "*", "term.everything*")
+	matches, _ := filepath.Glob(pattern)
+	for _, match := range matches {
+		if info, err := os.Stat(match); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return match
+		}
+	}
+	return ""
+}
+
+func wrapWithXwayland(runCmd string) (string, error) {
+	if !commandExists("Xwayland") {
+		return "", fmt.Errorf("Xwayland not found (install xorg-x11-server-Xwayland)")
+	}
+	if !commandExists("matchbox-window-manager") {
+		return "", fmt.Errorf("matchbox-window-manager not found (install matchbox-window-manager)")
+	}
+
+	displayNum, err := findFreeXDisplay()
+	if err != nil {
+		return "", err
+	}
+	display := fmt.Sprintf(":%d", displayNum)
+	socketPath := fmt.Sprintf("/tmp/.X11-unix/X%d", displayNum)
+	logPath := fmt.Sprintf("/tmp/teams-cli-xwayland-%d.log", displayNum)
+
+	// Start Xwayland + WM, wait for socket, run command, then cleanup.
+	script := strings.Join([]string{
+		fmt.Sprintf("exec >%s 2>&1", shQuote(logPath)),
+		"set -x",
+		fmt.Sprintf("Xwayland %s -retro & xw_pid=$!", display),
+		"trap 'kill $xw_pid $wm_pid' EXIT",
+		fmt.Sprintf("for i in $(seq 1 50); do [ -S %s ] && break; sleep 0.1; done", shQuote(socketPath)),
+		fmt.Sprintf("[ -S %s ] || { echo \"Xwayland did not create socket %s\"; exit 1; }", shQuote(socketPath), socketPath),
+		fmt.Sprintf("export DISPLAY=%s", display),
+		fmt.Sprintf("matchbox-window-manager -display %s & wm_pid=$!", display),
+		"export ELECTRON_DISABLE_SANDBOX=1",
+		runCmd,
+	}, "; ")
+
+	return script, nil
+}
+
+func wrapWithLogging(runCmd string) string {
+	// Capture output from the wrapped command for debugging.
+	return strings.Join([]string{
+		"log=/tmp/teams-cli-auth-$$.log",
+		"echo \"auth refresh log: $log\"",
+		"exec >$log 2>&1",
+		"set -x",
+		runCmd,
+	}, "; ")
+}
+
+func findFreeXDisplay() (int, error) {
+	for i := 5; i < 100; i++ {
+		path := fmt.Sprintf("/tmp/.X11-unix/X%d", i)
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				return i, nil
+			}
+			return 0, err
+		}
+	}
+	return 0, fmt.Errorf("no free X display found in /tmp/.X11-unix")
+}
+
+func shQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func fileExists(path string) bool {

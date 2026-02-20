@@ -6,8 +6,12 @@ if command -v readlink >/dev/null 2>&1; then
   SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH" 2>/dev/null || echo "$SCRIPT_PATH")"
 fi
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+GO_CACHE_ROOT="$SCRIPT_DIR/.cache/go"
 CACHE_DIR="$SCRIPT_DIR/.cache/go-build"
+MOD_CACHE_DIR="$GO_CACHE_ROOT/pkg/mod"
+GOPATH_DIR="$GO_CACHE_ROOT"
 mkdir -p "$CACHE_DIR"
+mkdir -p "$MOD_CACHE_DIR"
 
 cd "$SCRIPT_DIR"
-exec env GOCACHE="$CACHE_DIR" go run . "$@"
+exec env GOCACHE="$CACHE_DIR" GOPATH="$GOPATH_DIR" GOMODCACHE="$MOD_CACHE_DIR" go run . "$@"

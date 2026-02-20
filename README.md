@@ -57,23 +57,40 @@ teams-cli
 ## Development Run
 
 ```bash
-go run ./
+teams-cli-dev
 ```
 
-## teams-token Integration
+Notes:
+- `teams-cli` is the compiled binary (fast startup, no Go toolchain required).
+- `teams-cli-dev` runs the source via `go run` (slower startup, good for development).
 
-This repo includes `teams-token` as a git submodule for token refresh on `401 Unauthorized`.
+## Auth Refresh Integration
+
+This repo includes `teams-token-cli` and `term.everything` as git submodules for token refresh on `401 Unauthorized`.
 
 ```bash
 git submodule update --init --recursive
 ```
 
-On `401`, teams-cli will try to run `teams-token` using:
+On `401`, teams-cli will try to run the auth refresh app using:
 - local binary (`./teams-token/teams-token`)
 - Go (`go run .`)
 - Node (`yarn start` or `npm run start`, with install if needed)
 
-If a `401` still reaches the error page, a `Run teams-token` button appears for manual refresh.
+Auth refresh uses device code flow by default (terminal-only). If that fails, it falls back to the existing Electron flow.
+Set `TEAMS_CLI_DISABLE_DEVICE_CODE=1` to skip device code and use the Electron flow immediately.
+Set `TEAMS_CLI_TENANT=<tenant>` to override the default `common` tenant for device code flow.
+
+If `term.everything` is available, the Electron flow runs inside the terminal by default.
+Set `TEAMS_CLI_DISABLE_TERM_EVERYTHING=1` to fall back to direct Electron launch.
+
+If a `401` still reaches the error page, a `Run auth refresh` button appears for manual refresh.
+
+Build helper (optional, to generate a `term.everything` binary in `term.everything/dist/...`):
+
+```bash
+./scripts/build-term-everything.sh
+```
 
 ## Features
 

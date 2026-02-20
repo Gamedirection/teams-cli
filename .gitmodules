@@ -1,3 +1,6 @@
 [submodule "teams-token-cli"]
 	path = teams-token-cli
 	url = https://github.com/Gamedirection/teams-token-cli.git
+[submodule "term.everything"]
+	path = term.everything
+	url = https://github.com/mmulet/term.everything.git

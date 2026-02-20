@@ -43,7 +43,7 @@ All notable updates made during this project iteration are documented here.
 - teams-token integration:
   - added as optional submodule at `/teams-token`,
   - automatic 401 auth-refresh attempts,
-  - manual `Run teams-token` button on 401 error screen.
+  - manual `Run auth refresh` button on 401 error screen.
 - Installation/packaging improvements:
   - installer script targets system paths,
   - CLI command `teams-cli` available after install,
@@ -75,4 +75,3 @@ All notable updates made during this project iteration are documented here.
 ## Prior Baseline (before this iteration)
 - Existing Teams/channel listing and basic chat rendering from earlier project history.
 - teams-api and UI foundation already in place.
-
