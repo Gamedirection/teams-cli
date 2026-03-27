@@ -8,6 +8,8 @@ A terminal UI for Microsoft Teams powered by [teams-api](https://github.com/foss
 
 Current stable version: `v1.0.0`
 
+<img width="1088" height="1303" alt="image" src="https://github.com/user-attachments/assets/92acd70f-3615-475b-b5c2-b75a5c318ea6" />
+
 ## Install
 
 ### Linux one-line install (from GitHub)
