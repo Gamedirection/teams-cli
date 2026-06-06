@@ -3293,43 +3293,81 @@ func openInBrowser(url string) {
 	exec.Command("xdg-open", url).Start() //nolint
 }
 
-// downloadImage fetches a Teams CDN image with auth token, returns path to temp file.
-// Caller is responsible for deleting the file.
+// downloadImage fetches a Teams CDN image, returns path to cached file.
 func (s *AppState) downloadImage(imageURL string) (string, error) {
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", imageURL, nil)
-	if err != nil {
-		return "", err
+	home := os.Getenv("HOME")
+	configDir := filepath.Join(home, ".config", "fossteams")
+
+	// Determine cache path from URL hash
+	urlHash := fmt.Sprintf("%x", func() uint32 {
+		h := uint32(2166136261)
+		for _, b := range []byte(imageURL) { h ^= uint32(b); h *= 16777619 }
+		return h
+	}())
+	cacheDir := s.effectiveImageDir()
+	if mkErr := os.MkdirAll(cacheDir, 0o700); mkErr != nil {
+		cacheDir = os.TempDir()
 	}
-	// Teams media CDN requires the short skype token from the authz exchange,
-	// NOT the raw Azure AD JWT from token-skype.jwt.
-	// api.GetSkypeToken() performs the /authsvc/v1.0/authz exchange automatically.
+
+	// Try to serve from cache first (any extension)
+	if entries, _ := os.ReadDir(cacheDir); len(entries) > 0 {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), urlHash) {
+				if info, _ := e.Info(); info != nil && info.Size() > 512 {
+					return filepath.Join(cacheDir, e.Name()), nil
+				}
+			}
+		}
+	}
+
+	destPath := filepath.Join(cacheDir, urlHash+".jpg")
+
 	isMediaCDN := strings.Contains(imageURL, "asyncgw.teams.microsoft.com") ||
 		strings.Contains(imageURL, "ng.msg.teams.microsoft.com") ||
 		strings.Contains(imageURL, "statics.teams.cdn") ||
 		strings.Contains(imageURL, "teams.microsoft.com/v1/objects")
 
-	home := os.Getenv("HOME")
-	configDir := filepath.Join(home, ".config", "fossteams")
-
 	if isMediaCDN {
-		// Confirmed working: cookie "skypetoken_asm" with the SHORT token
-		// from the /api/authsvc/v1.0/authz exchange (NOT the raw JWT file).
+		// Use curl — Go's http.Client behaves differently from curl for Teams CDN.
+		// Confirmed working via curl testing: skypetoken_asm cookie + Authentication header.
 		shortToken := s.fetchShortSkypeToken(configDir)
-		if shortToken != "" {
-			req.AddCookie(&http.Cookie{Name: "skypetoken_asm", Value: shortToken})
-			req.Header.Set("Authentication", "skypetoken="+shortToken)
+		if shortToken == "" {
+			return "", fmt.Errorf("unable to get skype token for image download")
 		}
-		// Also send Bearer as fallback
+		spacesBearerJWT := ""
 		if data, e := os.ReadFile(filepath.Join(configDir, "token-skype.jwt")); e == nil {
-			req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(data)))
+			spacesBearerJWT = strings.TrimSpace(string(data))
 		}
-	} else {
-		if data, e := os.ReadFile(filepath.Join(configDir, "token-teams.jwt")); e == nil {
-			req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(data)))
+		args := []string{
+			"-s", "-L", "-o", destPath,
+			"--cookie", "skypetoken_asm=" + shortToken,
+			"-H", "Authentication: skypetoken=" + shortToken,
+			"-H", "Authorization: Bearer " + spacesBearerJWT,
+			"--max-time", "30",
+			imageURL,
 		}
+		out, curlErr := exec.Command("curl", args...).CombinedOutput()
+		if curlErr != nil {
+			return "", fmt.Errorf("curl: %v — %s", curlErr, strings.TrimSpace(string(out)))
+		}
+		// Verify we got actual image data (not an error HTML page)
+		if info, statErr := os.Stat(destPath); statErr != nil || info.Size() < 512 {
+			content, _ := os.ReadFile(destPath)
+			os.Remove(destPath)
+			return "", fmt.Errorf("image download failed (got %d bytes): %s", len(content), strings.TrimSpace(string(content))[:min(len(content), 200)])
+		}
+		return destPath, nil
 	}
-	resp, err := client.Do(req)
+
+	// Non-CDN: use Go http for public URLs
+	req, err := http.NewRequest("GET", imageURL, nil)
+	if err != nil {
+		return "", err
+	}
+	if data, e := os.ReadFile(filepath.Join(configDir, "token-teams.jwt")); e == nil {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(data)))
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -3339,53 +3377,24 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 		return "", fmt.Errorf("image fetch %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	// Detect extension from Content-Type
-	ext := ".jpg" // default assumption for Teams images
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		switch {
-		case strings.Contains(ct, "jpeg"):
-			ext = ".jpg"
-		case strings.Contains(ct, "png"):
-			ext = ".png"
-		case strings.Contains(ct, "gif"):
-			ext = ".gif"
-		case strings.Contains(ct, "webp"):
-			ext = ".webp"
-		}
-	}
-
-	// Save to persistent cache dir so the file survives across function calls
-	cacheDir := s.effectiveImageDir()
-	if mkErr := os.MkdirAll(cacheDir, 0o700); mkErr != nil {
-		cacheDir = os.TempDir()
-	}
-	// Use URL hash as filename for deduplication
-	urlHash := fmt.Sprintf("%x", func() uint32 {
-		h := uint32(2166136261)
-		for _, b := range []byte(imageURL) {
-			h ^= uint32(b)
-			h *= 16777619
-		}
-		return h
-	}())
-	imgPath := filepath.Join(cacheDir, urlHash+ext)
-
-	// Return cached file if it already exists and is non-empty
-	if info, statErr := os.Stat(imgPath); statErr == nil && info.Size() > 0 {
-		return imgPath, nil
-	}
-
-	tmp, err := os.Create(imgPath)
+	f, err := os.Create(destPath)
 	if err != nil {
 		return "", err
 	}
-	if _, err = io.Copy(tmp, resp.Body); err != nil {
-		tmp.Close()
-		os.Remove(imgPath)
+	if _, err = io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		os.Remove(destPath)
 		return "", err
 	}
-	tmp.Close()
-	return imgPath, nil
+	f.Close()
+	return destPath, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (s *AppState) renderImageChafa(imageURL string) (string, error) {
