@@ -953,6 +953,21 @@ func (s *AppState) fillMainWindow() {
 			s.showReactionPickerModal(msg)
 			return nil
 		}
+		if event.Key() == tcell.KeyRune && event.Rune() == 'o' {
+			current := chatView.GetCurrentItem()
+			if current >= 0 {
+				if msg, ok := s.getCurrentChatMessage(current); ok {
+					links := extractLinksFromHTML(msg.Content)
+					if len(links) == 0 {
+						composeView.SetTitle(s.composeTitleWithScanStatus() + " | No links in this message")
+					} else {
+						s.showLinkPickerModal(links)
+					}
+					return nil
+				}
+			}
+			return event
+		}
 		if s.bindingMatches(actionReloadKeybinds, event) {
 			if err := s.reloadKeybindingsConfig(); err != nil {
 				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Keybind reload failed")
@@ -1554,7 +1569,8 @@ func (s *AppState) createHelpModal() tview.Primitive {
 				"  " + key(actionScanNow) + "              scan now\n\n" +
 				"[green]Chat pane[-]\n" +
 				"  " + key(actionReplyMessage) + "                   reply to message\n" +
-				"  " + key(actionReactMessage) + "                   react (picker)\n\n" +
+				"  " + key(actionReactMessage) + "                   react (picker)\n" +
+				"  o                   open link / image\n\n" +
 				"[green]Compose[-]\n" +
 				"  " + key(actionFocusCompose) + "                   focus compose\n" +
 				"  Enter              send message\n" +
@@ -2979,6 +2995,121 @@ func extractConversationID(targetLink string) string {
 	return ""
 }
 
+type linkItem struct {
+	url     string
+	text    string
+	isImage bool
+}
+
+func extractLinksFromHTML(input string) []linkItem {
+	var items []linkItem
+	seen := map[string]bool{}
+	z := html.NewTokenizer(bytes.NewBuffer([]byte(input)))
+	var lastHref string
+	var lastText string
+	for {
+		tt := z.Next()
+		if tt == html.ErrorToken {
+			break
+		}
+		switch tt {
+		case html.StartTagToken, html.SelfClosingTagToken:
+			tag, hasAttr := z.TagName()
+			tagName := string(tag)
+			attrs := map[string]string{}
+			for hasAttr {
+				k, v, more := z.TagAttr()
+				attrs[string(k)] = string(v)
+				if !more {
+					break
+				}
+			}
+			if tagName == "a" {
+				lastHref = strings.TrimSpace(attrs["href"])
+				lastText = ""
+			}
+			if tagName == "img" {
+				src := strings.TrimSpace(attrs["src"])
+				if src != "" && !seen[src] {
+					seen[src] = true
+					alt := attrs["alt"]
+					if alt == "" {
+						alt = "image"
+					}
+					items = append(items, linkItem{url: src, text: alt, isImage: true})
+				}
+			}
+		case html.EndTagToken:
+			tag, _ := z.TagName()
+			if string(tag) == "a" && lastHref != "" && !seen[lastHref] {
+				seen[lastHref] = true
+				text := strings.TrimSpace(lastText)
+				if text == "" {
+					text = lastHref
+				}
+				items = append(items, linkItem{url: lastHref, text: text, isImage: false})
+				lastHref = ""
+				lastText = ""
+			}
+		case html.TextToken:
+			if lastHref != "" {
+				lastText += string(z.Text())
+			}
+		}
+	}
+	// Also catch bare URLs in plain text
+	urlRe := regexp.MustCompile(`https?://[^\s<>"']+`)
+	for _, match := range urlRe.FindAllString(input, -1) {
+		if !seen[match] {
+			seen[match] = true
+			items = append(items, linkItem{url: match, text: match, isImage: false})
+		}
+	}
+	return items
+}
+
+func openInBrowser(url string) {
+	exec.Command("xdg-open", url).Start() //nolint
+}
+
+func (s *AppState) renderImageChafa(imageURL string) (string, error) {
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", imageURL, nil)
+	if err != nil {
+		return "", err
+	}
+	// Try to attach Teams bearer token for authenticated CDN images
+	tokenPath := filepath.Join(os.Getenv("HOME"), ".config", "fossteams", "token-teams.jwt")
+	if data, readErr := os.ReadFile(tokenPath); readErr == nil {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(data)))
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("image fetch returned %d", resp.StatusCode)
+	}
+
+	tmp, err := os.CreateTemp("", "teams-img-*.bin")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err = io.Copy(tmp, resp.Body); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	tmp.Close()
+
+	out, err := exec.Command("chafa", "--format", "symbols", "--size", "60x20", tmp.Name()).Output()
+	if err != nil {
+		return "", fmt.Errorf("chafa error: %v", err)
+	}
+	return string(out), nil
+}
+
 func textMessage(input string) string {
 	output := ""
 	z := html.NewTokenizer(bytes.NewBuffer([]byte(input)))
@@ -3203,6 +3334,131 @@ func (s *AppState) showReactionPickerModal(msg csa.ChatMessage) {
 
 	s.pages.AddPage(PageReactionPicker, modal, true, true)
 	s.app.SetFocus(list)
+}
+
+func (s *AppState) showLinkPickerModal(links []linkItem) {
+	if len(links) == 0 {
+		return
+	}
+	if len(links) == 1 {
+		item := links[0]
+		if item.isImage {
+			s.showImageOptionsModal(item)
+		} else {
+			openInBrowser(item.url)
+		}
+		return
+	}
+
+	list := tview.NewList().ShowSecondaryText(true)
+	list.SetBorder(true).SetTitle(" Open Link ").SetTitleAlign(tview.AlignCenter)
+	for _, it := range links {
+		item := it
+		kind := "link"
+		if item.isImage {
+			kind = "image"
+		}
+		list.AddItem(item.text, kind+" | "+item.url, 0, func() {
+			s.pages.RemovePage(PageLinkPicker)
+			if item.isImage {
+				s.showImageOptionsModal(item)
+			} else {
+				openInBrowser(item.url)
+			}
+		})
+	}
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			s.pages.RemovePage(PageLinkPicker)
+			return nil
+		}
+		return event
+	})
+	height := len(links) + 4
+	if height > 18 {
+		height = 18
+	}
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(list, height, 1, true).
+			AddItem(nil, 0, 1, false), 70, 1, true).
+		AddItem(nil, 0, 1, false)
+	s.pages.AddPage(PageLinkPicker, modal, true, true)
+	s.app.SetFocus(list)
+}
+
+func (s *AppState) showImageOptionsModal(item linkItem) {
+	list := tview.NewList().ShowSecondaryText(false)
+	list.SetBorder(true).SetTitle(" "+item.text+" ").SetTitleAlign(tview.AlignCenter)
+	list.AddItem("Open in browser", "", 0, func() {
+		s.pages.RemovePage(PageLinkPicker)
+		openInBrowser(item.url)
+	})
+	list.AddItem("View in terminal", "", 0, func() {
+		s.pages.RemovePage(PageLinkPicker)
+		s.openImageInTerminal(item)
+	})
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			s.pages.RemovePage(PageLinkPicker)
+			return nil
+		}
+		return event
+	})
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(list, 6, 1, true).
+			AddItem(nil, 0, 1, false), 34, 1, true).
+		AddItem(nil, 0, 1, false)
+	s.pages.AddPage(PageLinkPicker, modal, true, true)
+	s.app.SetFocus(list)
+}
+
+func (s *AppState) openImageInTerminal(item linkItem) {
+	composeView, _ := s.components[ViCompose].(*tview.InputField)
+	if composeView != nil {
+		composeView.SetTitle(s.composeTitleWithScanStatus() + " | Loading image...")
+		s.app.Draw()
+	}
+	go func() {
+		rendered, err := s.renderImageChafa(item.url)
+		s.app.QueueUpdateDraw(func() {
+			if composeView != nil {
+				composeView.SetTitle(s.composeTitleWithScanStatus())
+			}
+			if err != nil {
+				if composeView != nil {
+					composeView.SetTitle(s.composeTitleWithScanStatus() + " | Image load failed: " + err.Error())
+				}
+				return
+			}
+			tv := tview.NewTextView().
+				SetText(rendered).
+				SetDynamicColors(false).
+				SetScrollable(true)
+			tv.SetBorder(true).SetTitle(" "+item.text+" (Esc to close) ").SetTitleAlign(tview.AlignCenter)
+			tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+				if event.Key() == tcell.KeyEscape {
+					s.pages.RemovePage(PageImageView)
+					return nil
+				}
+				return event
+			})
+			modal := tview.NewFlex().
+				AddItem(nil, 0, 1, false).
+				AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+					AddItem(nil, 0, 1, false).
+					AddItem(tv, 24, 1, true).
+					AddItem(nil, 0, 1, false), 66, 1, true).
+				AddItem(nil, 0, 1, false)
+			s.pages.AddPage(PageImageView, modal, true, true)
+			s.app.SetFocus(tv)
+		})
+	}()
 }
 
 func (s *AppState) sendReaction(message csa.ChatMessage, reaction string) error {

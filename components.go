@@ -28,4 +28,6 @@ const (
 	PageError           = "pageError"
 	PageHelp            = "pageHelp"
 	PageReactionPicker  = "pageReactionPicker"
+	PageLinkPicker      = "pageLinkPicker"
+	PageImageView       = "pageImageView"
 )
