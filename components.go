@@ -26,4 +26,5 @@ const (
 	PageMain  = "pageMain"
 	PageLogin = "pageLogin"
 	PageError = "pageError"
+	PageHelp  = "pageHelp"
 )
