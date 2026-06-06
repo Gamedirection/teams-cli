@@ -75,7 +75,7 @@ function waitForRedirect(page: Page): Promise<string> {
       if (settled) return;
       settled = true;
       // Navigate away immediately to prevent Teams web app loading in terminal
-      page.goto('about:blank').catch(() => {});
+      page.goto('about:blank', { timeout: 0 }).catch(() => {});
       resolve(hash);
     };
 
@@ -188,6 +188,8 @@ async function main() {
   try {
     const pages = await browser.pages();
     const page = pages[0] || await browser.newPage();
+    page.setDefaultTimeout(0);
+    page.setDefaultNavigationTimeout(0);
     await page.setUserAgent(USER_AGENT);
 
     let currentTenant: string | null = null;
