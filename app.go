@@ -2821,7 +2821,7 @@ func reactionToEmoji(name string) string {
 	case "angry":
 		return "😠"
 	default:
-		return name
+		return "👍"
 	}
 }
 
