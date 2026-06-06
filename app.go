@@ -3531,7 +3531,6 @@ func (s *AppState) showImageOptionsModal(item linkItem) {
 		composeView, _ := s.components[ViCompose].(*tview.InputField)
 		if composeView != nil {
 			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Downloading image...")
-			s.app.Draw()
 		}
 		go func() {
 			defer func() {
@@ -3578,7 +3577,6 @@ func (s *AppState) openImageInTerminal(item linkItem) {
 	composeView, _ := s.components[ViCompose].(*tview.InputField)
 	if composeView != nil {
 		composeView.SetTitle(s.composeTitleWithScanStatus() + " | Loading image...")
-		s.app.Draw()
 	}
 	go func() {
 		defer func() { recover() }() //nolint
