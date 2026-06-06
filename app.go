@@ -111,11 +111,12 @@ type AppState struct {
 	groups        map[string][]string
 	groupOrder    []string
 
-	treeNodesMu   sync.Mutex
-	chatsTreeNode  *tview.TreeNode
-	favTreeNode    *tview.TreeNode
-	recentTreeNode *tview.TreeNode
-	groupTreeNodes map[string]*tview.TreeNode
+	treeNodesMu        sync.Mutex
+	chatsTreeNode       *tview.TreeNode
+	favTreeNode         *tview.TreeNode
+	recentTreeNode      *tview.TreeNode
+	groupTreeNodes      map[string]*tview.TreeNode
+	mostRecentChatNode  *tview.TreeNode
 }
 
 type conversationRef struct {
@@ -678,6 +679,7 @@ func (s *AppState) fillMainWindow() {
 	s.favTreeNode = favoritesNode
 	s.recentTreeNode = recentNode
 	s.groupTreeNodes = newGroupNodes
+	s.mostRecentChatNode = mostRecentChatNode
 	s.treeNodesMu.Unlock()
 	settingsNode := tview.NewTreeNode("Settings & Help")
 	settingsNode.SetColor(tcell.ColorLightSkyBlue)
@@ -833,12 +835,17 @@ func (s *AppState) fillMainWindow() {
 			return event
 		}
 		if event.Key() == tcell.KeyRune && event.Rune() == 'G' {
-			candidates := recentNode.GetChildren()
-			if len(candidates) == 0 {
-				candidates = favoritesNode.GetChildren()
+			s.treeNodesMu.Lock()
+			node := s.mostRecentChatNode
+			s.treeNodesMu.Unlock()
+			if node == nil {
+				// fallback: first child of recentNode
+				kids := recentNode.GetChildren()
+				if len(kids) > 0 {
+					node = kids[0]
+				}
 			}
-			if len(candidates) > 0 {
-				node := candidates[0]
+			if node != nil {
 				treeView.SetCurrentNode(node)
 				if ref, ok := node.GetReference().(conversationRef); ok && len(ref.ids) > 0 {
 					ref.isUnread = false
@@ -3204,7 +3211,7 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 	}
 
 	// Detect extension from Content-Type
-	ext := ".bin"
+	ext := ".jpg" // default assumption for Teams images
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		switch {
 		case strings.Contains(ct, "jpeg"):
@@ -3218,17 +3225,38 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 		}
 	}
 
-	tmp, err := os.CreateTemp("", "teams-img-*"+ext)
+	// Save to persistent cache dir so the file survives across function calls
+	cacheDir := filepath.Join(os.Getenv("HOME"), ".local", "share", "teams-cli", "images")
+	if mkErr := os.MkdirAll(cacheDir, 0o700); mkErr != nil {
+		cacheDir = os.TempDir()
+	}
+	// Use URL hash as filename for deduplication
+	urlHash := fmt.Sprintf("%x", func() uint32 {
+		h := uint32(2166136261)
+		for _, b := range []byte(imageURL) {
+			h ^= uint32(b)
+			h *= 16777619
+		}
+		return h
+	}())
+	imgPath := filepath.Join(cacheDir, urlHash+ext)
+
+	// Return cached file if it already exists and is non-empty
+	if info, statErr := os.Stat(imgPath); statErr == nil && info.Size() > 0 {
+		return imgPath, nil
+	}
+
+	tmp, err := os.Create(imgPath)
 	if err != nil {
 		return "", err
 	}
 	if _, err = io.Copy(tmp, resp.Body); err != nil {
 		tmp.Close()
-		os.Remove(tmp.Name())
+		os.Remove(imgPath)
 		return "", err
 	}
 	tmp.Close()
-	return tmp.Name(), nil
+	return imgPath, nil
 }
 
 func (s *AppState) renderImageChafa(imageURL string) (string, error) {
@@ -3236,10 +3264,10 @@ func (s *AppState) renderImageChafa(imageURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer os.Remove(path)
+	// Don't remove — file is cached in ~/.local/share/teams-cli/images/
 	out, err := exec.Command("chafa", "--format", "symbols", "--size", "60x20", path).CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("chafa: %v — %s", err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("chafa: %v\nfile: %s\noutput: %s", err, path, strings.TrimSpace(string(out)))
 	}
 	return string(out), nil
 }
