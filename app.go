@@ -3212,10 +3212,22 @@ func textMessage(input string) string {
 					output += alt
 				}
 			} else if tagName == "img" {
-				if strings.Contains(strings.ToLower(attrs["class"]), "emoji") {
+				class := strings.ToLower(attrs["class"])
+				if strings.Contains(class, "emoji") {
 					if alt := strings.TrimSpace(attrs["alt"]); alt != "" {
 						output += alt
 					}
+				} else {
+					// Non-emoji image: show placeholder with filename or alt
+					label := strings.TrimSpace(attrs["alt"])
+					if label == "" {
+						src := attrs["src"]
+						label = filepath.Base(strings.Split(src, "?")[0])
+					}
+					if label == "" || label == "." {
+						label = "image"
+					}
+					output += "🖼️ " + label + "\n"
 				}
 			}
 		}
