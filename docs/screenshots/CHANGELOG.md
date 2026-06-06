@@ -2,6 +2,39 @@
 
 All notable updates made during this project iteration are documented here.
 
+## [v1.1.0] - 2026-06-05
+
+### Added
+- **Custom chat groups**: organize any chat into named groups stored alongside Favorites.
+  - Press `g` on a chat to open a picker: move to existing group, create a new group, or remove from group (returns to Recent).
+  - Press `g` on a group header to rename or delete the group (chats return to Recent on delete).
+  - Groups persist encrypted in `~/.config/fossteams/teams-cli-settings.enc`.
+  - Tree order: Favorites → [Groups in display order] → Recent.
+- **Keybinding cheatsheet overlay**: press `?` from tree or chat pane to toggle a centered help modal showing all current keybindings. Dismiss with `?` or `Esc`. Blocked in compose so `?` can still be typed in messages.
+- **Message timestamps**: each message now shows send time in dark grey (`HH:MM AM/PM`) next to the author name.
+- **"No messages yet." placeholder** when a conversation has no messages.
+
+### Changed
+- **Chat message layout redesign**:
+  - Author name displayed above message content (header-first, matching standard chat app conventions).
+  - Content lines indented 2 spaces under the author header.
+  - Blank line between each message for visual separation.
+  - Secondary text disabled; author, timestamp, and reactions embedded in the primary line.
+- **Scroll-to-bottom on load**: uses `QueueUpdateDraw` to reliably position at the latest message after initial load.
+- **Installer improvements** (`scripts/install.sh`):
+  - `chown` install dir to the invoking user so `go run` can write `.cache` without `sudo`.
+  - Launcher GOCACHE moved from `/opt/teams-cli/.cache` to `$HOME/.cache/teams-cli/go-build`.
+  - `teams-token-cli` set up automatically: yarn install, TypeScript upgrade, system electron detection and symlink (`electron41/39/37`), `path.txt` written without trailing newline.
+  - Post-install message prints first-time auth instructions.
+  - `node` added to dependency check list.
+
+### Fixed
+- Running `teams-cli` as a regular user failed with permission denied on `.cache` write under `/opt`.
+- `teams-token-cli` build failures on modern Node (TypeScript 4.2 vs undici-types parse errors, missing `rootDir`, deprecated `baseUrl`).
+- Electron binary not found after `yarn install` when no pre-built binary is downloaded (resolved via system electron symlink).
+
+---
+
 ## [v1.0.0] - 2026-02-19
 
 ### Added
@@ -75,4 +108,3 @@ All notable updates made during this project iteration are documented here.
 ## Prior Baseline (before this iteration)
 - Existing Teams/channel listing and basic chat rendering from earlier project history.
 - teams-api and UI foundation already in place.
-
