@@ -6,7 +6,7 @@
 
 A terminal UI for Microsoft Teams powered by [teams-api](https://github.com/fossteams/teams-api).
 
-Current stable version: `v1.0.0`
+Current stable version: `v1.1.0`
 
 <img width="1091" height="641" alt="image" src="https://github.com/user-attachments/assets/8a15d464-74d7-4728-9f74-2b8452c45689" />
 
@@ -46,12 +46,19 @@ curl -fsSL https://raw.githubusercontent.com/Gamedirection/teams-cli/master/scri
 ```
 
 The installer:
-- clones/updates into `/opt/teams-cli`
+- clones/updates the repo into `/opt/teams-cli`
+- sets ownership to the invoking user (no sudo needed to run)
 - installs `teams-cli` into `/usr/local/bin`
-- installs desktop icon from `img/DarkMode_Color.svg`
-- installs a `teams-cli.desktop` launcher
+- installs desktop icon and `.desktop` launcher
+- sets up `teams-token-cli` automatically (yarn, TypeScript, system Electron)
 
-## Run
+After install, authenticate once:
+
+```bash
+cd /opt/teams-cli/teams-token-cli && yarn start
+```
+
+Then run:
 
 ```bash
 teams-cli
@@ -65,7 +72,7 @@ go run ./
 
 ## teams-token Integration
 
-This repo includes `teams-token` as a git submodule for token refresh on `401 Unauthorized`.
+This repo includes `teams-token-cli` as a git submodule for token refresh on `401 Unauthorized`.
 
 ```bash
 git submodule update --init --recursive
@@ -82,7 +89,7 @@ If a `401` still reaches the error page, a `Run teams-token` button appears for 
 
 We explored "all-in-terminal" auth alternatives and recorded the outcomes:
 
-- **Device Code Flow**: Rejected by Azure AD for the Teams client ID (`5e3ce6c0-2b1f-4285-8d4b-75ee78787346`). Error: `AADSTS70002` (“client must be marked as mobile/public”).
+- **Device Code Flow**: Rejected by Azure AD for the Teams client ID (`5e3ce6c0-2b1f-4285-8d4b-75ee78787346`). Error: `AADSTS70002` ("client must be marked as mobile/public").
 - **term.everything + Xwayland**: Electron consistently aborted (futex/SIGABRT) even with sandbox disabled and GPU/dev-shm flags.
 - **term.everything + Wayland/Ozone**: Electron failed to initialize Wayland and, in some runs, hit OOM during startup.
 
@@ -100,11 +107,13 @@ We explored "all-in-terminal" auth alternatives and recorded the outcomes:
 - DM/chat read (recent first)
 - Send messages in channels and chats
 - Chat favorites (`f`)
+- Custom chat groups (`g`) — create, rename, delete named groups; move chats between them
 - Private Notes chat auto-detected and grouped into Favorites
 - Chat title refresh (`u`)
 - Unread marker auto-refresh every minute (toggle with `m`, manual scan with `Shift+M`)
 - Compose title shows scanner status (`ON/OFF`), scan progress, and last scan result
 - Manual mark unread hotkey (`r`) for selected chat
+- Keybinding cheatsheet overlay (`?`) — press from tree or chat pane, dismiss with `?` or `Esc`
 - Built-in `Settings & Help` chat at the bottom of the tree
 - In-app keybinding settings menu in `Settings & Help`:
   - Enter on config row opens your `$VISUAL` / `$EDITOR`
@@ -116,13 +125,16 @@ We explored "all-in-terminal" auth alternatives and recorded the outcomes:
   - `Scroll` (single-line messages)
   - configurable wrap characters (`20/40/72/80/100/200/400/600/800/1000/custom`)
   - actual visible wrap is capped by current chat pane width
-  - wrap mode keeps the same message/author secondary styling as scroll mode
 - Theme color customization in `Settings & Help`:
   - `Compose Color` cycles darker blue variants (`midnight`, `navy`, `dark_blue`, `slate`)
   - `Username Color` cycles (`blue`, `yellow`, `green`, `cyan`, `white`)
   - both are stored in encrypted settings
-- Message reactions display in chat (`Reactions: ...`)
-- Quick react hotkey in chat (`e` adds 👍 to selected message, server + local fallback)
+- Message layout:
+  - author name displayed above message content
+  - send time shown in dark grey next to author
+  - blank line between messages
+  - "No messages yet." placeholder for empty conversations
+- Message reactions display and quick react hotkey (`e` adds 👍)
 - Reply mode in chat (`r` replies to selected message)
 - Mentions in compose:
   - `@name` prefers current chat members, then global contacts
@@ -133,6 +145,7 @@ We explored "all-in-terminal" auth alternatives and recorded the outcomes:
 - Keybinding presets: `default`, `vim`, `emacs`, `jk`
 - Encrypted persistence of:
   - favorites
+  - custom groups
   - updated chat titles
 - Encrypted settings files:
   - `~/.config/fossteams/teams-cli-settings.enc`
@@ -140,19 +153,24 @@ We explored "all-in-terminal" auth alternatives and recorded the outcomes:
 
 ## Keybindings
 
-- `Tab`: next pane
-- `Shift+Tab`: previous pane
-- `i`: focus compose input
-- `Enter` (compose): send message
-- `Esc` (compose): back to tree
-- `f`: toggle favorite for selected/hovered chat
-- `u`: refresh chat titles
-- `r` (tree pane): mark selected chat unread
-- `r` (chat pane): reply to selected message
-- `e` (chat pane): react 👍 to selected message
-- `m`: toggle 1-minute unread scan on/off
-- `Shift+M`: run unread scan immediately
-- `Ctrl+R`: reload keybindings config without restarting
+| Key | Context | Action |
+|-----|---------|--------|
+| `Tab` | global | next pane |
+| `Shift+Tab` | global | previous pane |
+| `?` | tree / chat | toggle keybinding cheatsheet |
+| `i` | tree | focus compose input |
+| `f` | tree | toggle favorite for selected chat |
+| `g` | tree (chat node) | move chat to group |
+| `g` | tree (group header) | rename / delete group |
+| `u` | tree | refresh chat titles |
+| `r` | tree | mark selected chat unread |
+| `m` | tree | toggle 1-minute unread scan |
+| `Shift+M` | tree | run unread scan immediately |
+| `Ctrl+R` | tree | reload keybindings config |
+| `r` | chat | reply to selected message |
+| `e` | chat | react 👍 to selected message |
+| `Enter` | compose | send message |
+| `Esc` | compose | back to tree |
 
 ## Keybinding Config
 
@@ -200,9 +218,8 @@ In-app keybinding editor notes:
 Planned messaging/UX improvements:
 - TTS playback for messages
 - Inline image viewer for chat attachments
-- Reactions support (view/add)
-- Reply/thread support from CLI
 - Better unread detection and sync accuracy
+- Scroll/pagination for long chat histories
 
 ## Packaging Roadmap
 
