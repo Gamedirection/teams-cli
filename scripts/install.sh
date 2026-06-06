@@ -37,7 +37,11 @@ git -C "${INSTALL_DIR}" submodule update --init --recursive
 # Give ownership to real user so teams-cli can write .cache
 chown -R "${REAL_USER}:${REAL_USER}" "${INSTALL_DIR}"
 
-# Fix launcher to use $HOME/.cache instead of install dir
+# Build binary as real user
+echo "Building teams-cli binary..."
+su - "${REAL_USER}" -c "cd '${INSTALL_DIR}' && go build -o teams-cli-bin ." || true
+
+# Write launcher: use pre-built binary if present, fall back to go run
 cat > "${INSTALL_DIR}/teams-cli" <<'LAUNCHER'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -47,9 +51,13 @@ if command -v readlink >/dev/null 2>&1; then
   SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH" 2>/dev/null || echo "$SCRIPT_PATH")"
 fi
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+if [[ -x "$SCRIPT_DIR/teams-cli-bin" ]]; then
+  exec "$SCRIPT_DIR/teams-cli-bin" "$@"
+fi
+
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/teams-cli/go-build"
 mkdir -p "$CACHE_DIR"
-
 cd "$SCRIPT_DIR"
 exec env GOCACHE="$CACHE_DIR" go run . "$@"
 LAUNCHER
