@@ -3534,7 +3534,11 @@ func (s *AppState) showImageOptionsModal(item linkItem) {
 			s.app.Draw()
 		}
 		go func() {
-			// Download with auth token; open temp file in browser
+			defer func() {
+				if r := recover(); r != nil {
+					openInBrowser(item.url) // crash fallback: try direct URL
+				}
+			}()
 			path, err := s.downloadImage(item.url)
 			s.app.QueueUpdateDraw(func() {
 				if composeView != nil {
@@ -3542,12 +3546,10 @@ func (s *AppState) showImageOptionsModal(item linkItem) {
 				}
 			})
 			if err != nil {
-				// Fallback: open URL directly (works for public images)
-				openInBrowser(item.url)
+				openInBrowser(item.url) // no token or fetch failed: try direct
 				return
 			}
-			// Don't delete — browser needs the file; OS will clean temp on reboot
-			openInBrowser(path)
+			openInBrowser(path) // open downloaded temp file
 		}()
 	})
 	list.AddItem("View in terminal", "", 0, func() {
