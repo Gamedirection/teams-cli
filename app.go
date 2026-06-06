@@ -1664,18 +1664,38 @@ func wrapTextLines(text string, width int) []string {
 			continue
 		}
 		rest := p
-		for len(rest) > 0 {
-			if len(rest) <= width {
+		for visibleLen(rest) > 0 {
+			if visibleLen(rest) <= width {
 				lines = append(lines, rest)
 				break
 			}
-			cut := width
-			segment := rest[:cut]
-			if idx := strings.LastIndex(segment, " "); idx > 0 {
-				cut = idx
+			// Find cut point based on visible length, not byte length
+			runes := []rune(rest)
+			visible := 0
+			cutRune := len(runes)
+			inTag := false
+			for i, r := range runes {
+				if r == '[' {
+					inTag = true
+				} else if r == ']' && inTag {
+					inTag = false
+					continue
+				}
+				if !inTag {
+					visible++
+					if visible >= width {
+						cutRune = i + 1
+						break
+					}
+				}
 			}
-			lines = append(lines, strings.TrimRight(rest[:cut], " "))
-			rest = strings.TrimLeft(rest[cut:], " ")
+			segment := string(runes[:cutRune])
+			if idx := strings.LastIndex(segment, " "); idx > 0 {
+				cutRune = idx
+				segment = string(runes[:cutRune])
+			}
+			lines = append(lines, strings.TrimRight(segment, " "))
+			rest = strings.TrimLeft(string(runes[cutRune:]), " ")
 		}
 	}
 	if len(lines) == 0 {
@@ -3196,9 +3216,19 @@ func (s *AppState) renderImageChafa(imageURL string) (string, error) {
 	return string(out), nil
 }
 
+// tviewTagRe matches tview color/style tags like [red], [::b], [-], [#aabbcc].
+var tviewTagRe = regexp.MustCompile(`\[[^\[]*?\]`)
+
+// visibleLen returns the display length of a string, excluding tview markup tags.
+func visibleLen(s string) int {
+	return len([]rune(tviewTagRe.ReplaceAllString(s, "")))
+}
+
 func textMessage(input string) string {
-	output := ""
+	var out strings.Builder
 	z := html.NewTokenizer(bytes.NewBuffer([]byte(input)))
+	inBlockquote := false
+
 	for {
 		tt := z.Next()
 		if tt == html.ErrorToken {
@@ -3207,13 +3237,13 @@ func textMessage(input string) string {
 		switch tt {
 		case html.TextToken:
 			text := string(z.Text())
-			if strings.TrimSpace(text) == "" {
+			if strings.TrimSpace(text) == "" && !inBlockquote {
 				continue
 			}
-			output += fmt.Sprintf("%v\n", text)
+			out.WriteString(text)
 		case html.StartTagToken, html.SelfClosingTagToken:
 			tagBytes, hasAttr := z.TagName()
-			tagName := string(tagBytes)
+			tagName := strings.ToLower(string(tagBytes))
 			attrs := map[string]string{}
 			for hasAttr {
 				k, v, more := z.TagAttr()
@@ -3222,33 +3252,63 @@ func textMessage(input string) string {
 					break
 				}
 			}
-			// Teams encodes emoji as <emoji alt="😊"> or <img class="emoji" alt="😊">
-			if tagName == "emoji" {
+			switch tagName {
+			case "b", "strong":
+				out.WriteString("[::b]")
+			case "i", "em":
+				out.WriteString("[::i]")
+			case "u":
+				out.WriteString("[::u]")
+			case "s", "strike", "del":
+				out.WriteString("[::s]")
+			case "code":
+				out.WriteString("[green]")
+			case "pre":
+				out.WriteString("[green]")
+			case "blockquote":
+				out.WriteString("[gray]▌ ")
+				inBlockquote = true
+			case "br":
+				out.WriteString("\n")
+			case "emoji":
 				if alt := strings.TrimSpace(attrs["alt"]); alt != "" {
-					output += alt
+					out.WriteString(alt)
 				}
-			} else if tagName == "img" {
+			case "img":
 				class := strings.ToLower(attrs["class"])
 				if strings.Contains(class, "emoji") {
 					if alt := strings.TrimSpace(attrs["alt"]); alt != "" {
-						output += alt
+						out.WriteString(alt)
 					}
 				} else {
-					// Non-emoji image: show placeholder with filename or alt
 					label := strings.TrimSpace(attrs["alt"])
 					if label == "" {
-						src := attrs["src"]
-						label = filepath.Base(strings.Split(src, "?")[0])
+						label = filepath.Base(strings.Split(attrs["src"], "?")[0])
 					}
 					if label == "" || label == "." {
 						label = "image"
 					}
-					output += "🖼️ " + label + "\n"
+					out.WriteString("🖼️ " + label)
 				}
+			}
+		case html.EndTagToken:
+			tagBytes, _ := z.TagName()
+			tagName := strings.ToLower(string(tagBytes))
+			switch tagName {
+			case "b", "strong", "i", "em", "u", "s", "strike", "del":
+				out.WriteString("[::-]")
+			case "code", "pre":
+				out.WriteString("[-]")
+			case "blockquote":
+				out.WriteString("[-]")
+				inBlockquote = false
+			case "p", "div":
+				out.WriteString("\n")
 			}
 		}
 	}
-	return output
+	result := strings.TrimRight(out.String(), "\n")
+	return result + "\n"
 }
 
 func (s *AppState) loadConversations(c *csa.Channel) {
@@ -3303,7 +3363,28 @@ func expandImageTags(content string) string {
 	})
 }
 
+// markdownToHTML converts markdown syntax to Teams HTML before sending.
+func markdownToHTML(text string) string {
+	// Process multi-char patterns first to avoid partial matches
+	text = regexp.MustCompile(`\*\*(.+?)\*\*`).ReplaceAllString(text, "<strong>$1</strong>")
+	text = regexp.MustCompile(`__(.+?)__`).ReplaceAllString(text, "<u>$1</u>")
+	text = regexp.MustCompile(`~~(.+?)~~`).ReplaceAllString(text, "<s>$1</s>")
+	text = regexp.MustCompile(`\*(.+?)\*`).ReplaceAllString(text, "<em>$1</em>")
+	text = regexp.MustCompile(`_(.+?)_`).ReplaceAllString(text, "<em>$1</em>")
+	text = regexp.MustCompile("```([\\s\\S]+?)```").ReplaceAllString(text, "<pre><code>$1</code></pre>")
+	text = regexp.MustCompile("`(.+?)`").ReplaceAllString(text, "<code>$1</code>")
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "> ") {
+			quote := strings.TrimPrefix(strings.TrimSpace(line), "> ")
+			lines[i] = "<blockquote>" + quote + "</blockquote>"
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func formatOutgoingHTML(content string, reply *replyTarget) string {
+	content = markdownToHTML(content)
 	lines := strings.Split(content, "\n")
 	for i := range lines {
 		lines[i] = strings.TrimSpace(lines[i])
