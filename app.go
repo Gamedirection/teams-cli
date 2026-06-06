@@ -3248,6 +3248,40 @@ func extractLinksFromHTML(input string) []linkItem {
 	return items
 }
 
+// fetchShortSkypeToken exchanges the skype JWT for the short skype token
+// needed by the Teams CDN (skypetoken_asm cookie). Returns "" on failure.
+func (s *AppState) fetchShortSkypeToken(configDir string) string {
+	jwtData, err := os.ReadFile(filepath.Join(configDir, "token-skype.jwt"))
+	if err != nil {
+		return ""
+	}
+	jwtStr := strings.TrimSpace(string(jwtData))
+
+	req, err := http.NewRequest("POST", "https://teams.microsoft.com/api/authsvc/v1.0/authz", nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("ms-teams-authz-type", "TokenRefresh")
+	req.Header.Set("Authorization", "Bearer "+jwtStr)
+	req.ContentLength = 0
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Tokens struct {
+			SkypeToken string `json:"skypeToken"`
+		} `json:"tokens"`
+	}
+	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return ""
+	}
+	return result.Tokens.SkypeToken
+}
+
 func openInBrowser(url string) {
 	exec.Command("xdg-open", url).Start() //nolint
 }
@@ -3272,15 +3306,14 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 	configDir := filepath.Join(home, ".config", "fossteams")
 
 	if isMediaCDN {
-		// Try all three auth approaches that Teams CDN accepts
-		if skypeToken, skypeErr := api.GetSkypeToken(); skypeErr == nil {
-			raw := skypeToken.Inner.Raw
-			// 1. Custom Authentication header (Teams internal protocol)
-			req.Header.Set("Authentication", "skypetoken="+raw)
-			// 2. Cookie (browser-style auth)
-			req.AddCookie(&http.Cookie{Name: "skypetoken_asm", Value: raw})
+		// Confirmed working: cookie "skypetoken_asm" with the SHORT token
+		// from the /api/authsvc/v1.0/authz exchange (NOT the raw JWT file).
+		shortToken := s.fetchShortSkypeToken(configDir)
+		if shortToken != "" {
+			req.AddCookie(&http.Cookie{Name: "skypetoken_asm", Value: shortToken})
+			req.Header.Set("Authentication", "skypetoken="+shortToken)
 		}
-		// 3. Bearer with spaces token as Authorization
+		// Also send Bearer as fallback
 		if data, e := os.ReadFile(filepath.Join(configDir, "token-skype.jwt")); e == nil {
 			req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(data)))
 		}
