@@ -106,6 +106,7 @@ type AppState struct {
 	themeMu          sync.RWMutex
 	composeColorName string
 	authorColorName  string
+	imageDir         string
 
 	groupsMu      sync.RWMutex
 	groups        map[string][]string
@@ -165,6 +166,7 @@ type persistedChatSettings struct {
 	ChatWrapPercent *int                `json:"chat_wrap_percent,omitempty"`
 	ChatWrapChars   *int                `json:"chat_wrap_chars,omitempty"`
 	ChatMarkdown    *bool               `json:"chat_markdown,omitempty"`
+	ImageDir        string              `json:"image_dir,omitempty"`
 	ComposeColor    string              `json:"compose_color,omitempty"`
 	AuthorColor     string              `json:"author_color,omitempty"`
 	Groups          map[string][]string `json:"groups,omitempty"`
@@ -200,6 +202,7 @@ const (
 	settingsItemComposeColor = "compose_color"
 	settingsItemAuthorColor  = "author_color"
 	settingsItemMarkdown     = "chat_markdown"
+	settingsItemImageDir     = "image_dir"
 )
 
 const (
@@ -1166,6 +1169,8 @@ func (s *AppState) renderSettingsHelpItems(chatList *tview.List) {
 			chatList.AddItem("Username Color", s.formatAuthorColorLine()+" (Enter to cycle)", 0, nil)
 		case settingsItemMarkdown:
 			chatList.AddItem("Markdown", s.formatMarkdownLine()+" (Enter to toggle)", 0, nil)
+		case settingsItemImageDir:
+			chatList.AddItem("Image Save Folder", s.effectiveImageDir()+" (Enter to change)", 0, nil)
 		case settingsItemReload:
 			chatList.AddItem("Reload Keybindings", "Reload from config file (Enter/Ctrl+R)", 0, nil)
 		case settingsItemBinding:
@@ -1187,6 +1192,7 @@ func (s *AppState) buildSettingsItems() []settingsItem {
 		{kind: settingsItemWrap},
 		{kind: settingsItemWrapPct},
 		{kind: settingsItemMarkdown},
+		{kind: settingsItemImageDir},
 		{kind: settingsItemComposeColor},
 		{kind: settingsItemAuthorColor},
 		{kind: settingsItemSpacer},
@@ -1291,6 +1297,18 @@ func (s *AppState) handleSettingsSelection(index int) {
 		s.rerenderActiveChatMessages()
 		composeView.SetTitle(s.composeTitleWithScanStatus() + " | Markdown: " + s.formatMarkdownLine())
 		s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
+	case settingsItemImageDir:
+		s.promptImageDir(func(dir string, ok bool) {
+			if !ok {
+				return
+			}
+			s.themeMu.Lock()
+			s.imageDir = dir
+			s.themeMu.Unlock()
+			s.persistEncryptedChatSettings()
+			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Image folder: " + s.effectiveImageDir())
+			s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
+		})
 	case settingsItemBinding:
 		s.settingsMu.Lock()
 		s.settingsCaptureAction = item.action
@@ -1441,6 +1459,19 @@ func (s *AppState) applyComposeTheme() {
 	input.SetPlaceholderTextColor(tcell.ColorLightGray)
 }
 
+func (s *AppState) effectiveImageDir() string {
+	s.themeMu.RLock()
+	d := strings.TrimSpace(s.imageDir)
+	s.themeMu.RUnlock()
+	if d == "" {
+		d = filepath.Join(os.Getenv("HOME"), ".local", "share", "teams-cli", "images")
+	}
+	if strings.HasPrefix(d, "~/") {
+		d = filepath.Join(os.Getenv("HOME"), d[2:])
+	}
+	return d
+}
+
 func (s *AppState) formatMarkdownLine() string {
 	s.chatWordWrapMu.RLock()
 	md := s.chatMarkdown
@@ -1544,6 +1575,58 @@ func (s *AppState) setChatWrapChars(v int) {
 	s.chatWordWrapMu.Lock()
 	s.chatWrapChars = v
 	s.chatWordWrapMu.Unlock()
+}
+
+func (s *AppState) promptImageDir(onDone func(dir string, ok bool)) {
+	const pageImageDirInput = "pageImageDirInput"
+	input := tview.NewInputField().
+		SetLabel("Save folder: ").
+		SetFieldWidth(40).
+		SetText(s.effectiveImageDir())
+
+	commit := func() {
+		dir := strings.TrimSpace(input.GetText())
+		s.pages.RemovePage(pageImageDirInput)
+		if dir == "" {
+			onDone("", false)
+			return
+		}
+		if strings.HasPrefix(dir, "~/") {
+			dir = filepath.Join(os.Getenv("HOME"), dir[2:])
+		}
+		os.MkdirAll(dir, 0o700) //nolint
+		onDone(dir, true)
+	}
+
+	input.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEnter:
+			commit()
+			return nil
+		case tcell.KeyEscape:
+			s.pages.RemovePage(pageImageDirInput)
+			onDone("", false)
+			return nil
+		}
+		return event
+	})
+
+	form := tview.NewForm().
+		AddFormItem(input).
+		AddButton("Save", commit).
+		AddButton("Cancel", func() { s.pages.RemovePage(pageImageDirInput); onDone("", false) })
+	form.SetBorder(true).SetTitle(" Image Save Folder ").SetTitleAlign(tview.AlignCenter)
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(form, 7, 1, true).
+			AddItem(nil, 0, 1, false), 60, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	s.pages.AddPage(pageImageDirInput, modal, true, true)
+	s.app.SetFocus(input)
 }
 
 func (s *AppState) promptCustomWrapChars(onDone func(value int, ok bool)) {
@@ -3185,20 +3268,25 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 		strings.Contains(imageURL, "statics.teams.cdn") ||
 		strings.Contains(imageURL, "teams.microsoft.com/v1/objects")
 
+	home := os.Getenv("HOME")
+	configDir := filepath.Join(home, ".config", "fossteams")
+
 	if isMediaCDN {
+		// Try all three auth approaches that Teams CDN accepts
 		if skypeToken, skypeErr := api.GetSkypeToken(); skypeErr == nil {
-			// Authentication: skypetoken=<short_token>  (custom Teams CDN header)
-			req.Header.Set("Authentication", api.AuthString(skypeToken))
+			raw := skypeToken.Inner.Raw
+			// 1. Custom Authentication header (Teams internal protocol)
+			req.Header.Set("Authentication", "skypetoken="+raw)
+			// 2. Cookie (browser-style auth)
+			req.AddCookie(&http.Cookie{Name: "skypetoken_asm", Value: raw})
 		}
-		// Also send the spaces token as Authorization Bearer for good measure
-		if spacesToken, spacesErr := api.GetSkypeSpacesToken(); spacesErr == nil {
-			req.Header.Set("Authorization", "Bearer "+spacesToken.Inner.Raw)
+		// 3. Bearer with spaces token as Authorization
+		if data, e := os.ReadFile(filepath.Join(configDir, "token-skype.jwt")); e == nil {
+			req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(data)))
 		}
 	} else {
-		// Public/external image: use standard Bearer
-		home := os.Getenv("HOME")
-		if teamsData, e := os.ReadFile(filepath.Join(home, ".config", "fossteams", "token-teams.jwt")); e == nil {
-			req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(teamsData)))
+		if data, e := os.ReadFile(filepath.Join(configDir, "token-teams.jwt")); e == nil {
+			req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(data)))
 		}
 	}
 	resp, err := client.Do(req)
@@ -3207,7 +3295,8 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("image fetch returned %d (auth required?)", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return "", fmt.Errorf("image fetch %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	// Detect extension from Content-Type
@@ -3226,7 +3315,7 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 	}
 
 	// Save to persistent cache dir so the file survives across function calls
-	cacheDir := filepath.Join(os.Getenv("HOME"), ".local", "share", "teams-cli", "images")
+	cacheDir := s.effectiveImageDir()
 	if mkErr := os.MkdirAll(cacheDir, 0o700); mkErr != nil {
 		cacheDir = os.TempDir()
 	}
@@ -5068,6 +5157,7 @@ func (s *AppState) loadEncryptedChatSettings() error {
 	s.themeMu.Lock()
 	s.composeColorName = normalizeComposeColorName(settings.ComposeColor)
 	s.authorColorName = normalizeAuthorColorName(settings.AuthorColor)
+	s.imageDir = strings.TrimSpace(settings.ImageDir)
 	s.themeMu.Unlock()
 
 	return nil
@@ -5124,6 +5214,9 @@ func (s *AppState) persistEncryptedChatSettings() {
 	s.themeMu.RLock()
 	settings.ComposeColor = normalizeComposeColorName(s.composeColorName)
 	settings.AuthorColor = normalizeAuthorColorName(s.authorColorName)
+	s.themeMu.RLock()
+	settings.ImageDir = s.imageDir
+	s.themeMu.RUnlock()
 	s.themeMu.RUnlock()
 
 	plaintext, err := json.Marshal(settings)
