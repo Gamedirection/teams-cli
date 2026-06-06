@@ -30,4 +30,6 @@ const (
 	PageReactionPicker  = "pageReactionPicker"
 	PageLinkPicker      = "pageLinkPicker"
 	PageImageView       = "pageImageView"
+	PageChatSearch      = "pageChatSearch"
+	PageMsgSearch       = "pageMsgSearch"
 )

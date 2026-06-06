@@ -889,6 +889,10 @@ func (s *AppState) fillMainWindow() {
 			}
 			return nil
 		}
+		if event.Key() == tcell.KeyRune && event.Rune() == '/' {
+			s.showChatSearchModal(treeView)
+			return nil
+		}
 		if s.bindingMatches(actionRefreshTitles, event) {
 			go s.refreshAllChatLabels(chatsNode)
 			return nil
@@ -1028,6 +1032,10 @@ func (s *AppState) fillMainWindow() {
 				}
 			}
 			return event
+		}
+		if event.Key() == tcell.KeyRune && event.Rune() == '/' {
+			s.showMessageSearchModal()
+			return nil
 		}
 		if event.Key() == tcell.KeyRune && event.Rune() == 'G' {
 			n := chatView.GetItemCount()
@@ -1365,6 +1373,249 @@ func walkNodes(node *tview.TreeNode, fn func(*tview.TreeNode)) {
 	for _, child := range node.GetChildren() {
 		walkNodes(child, fn)
 	}
+}
+
+// fuzzyMatch returns true if every rune in pattern appears in order in text.
+func fuzzyMatch(pattern, text string) bool {
+	pattern = strings.ToLower(pattern)
+	text = strings.ToLower(text)
+	if pattern == "" {
+		return true
+	}
+	pi := 0
+	for _, r := range text {
+		if pi < len(pattern) && rune(pattern[pi]) == r {
+			pi++
+		}
+	}
+	return pi == len(pattern)
+}
+
+type chatSearchResult struct {
+	name string
+	node *tview.TreeNode
+	ref  conversationRef
+}
+
+func (s *AppState) collectChatSearchResults() []chatSearchResult {
+	var all []chatSearchResult
+	s.treeNodesMu.Lock()
+	root := s.chatsTreeNode
+	s.treeNodesMu.Unlock()
+	if root == nil {
+		return all
+	}
+	walkNodes(root, func(node *tview.TreeNode) {
+		ref, ok := node.GetReference().(conversationRef)
+		if !ok || ref.chatKey == "" || ref.chatKey == settingsHelpChatKey {
+			return
+		}
+		all = append(all, chatSearchResult{name: ref.title, node: node, ref: ref})
+	})
+	return all
+}
+
+func (s *AppState) showChatSearchModal(treeView *tview.TreeView) {
+	all := s.collectChatSearchResults()
+	var filtered []chatSearchResult
+
+	input := tview.NewInputField().SetLabel("/ ").SetFieldWidth(0)
+	input.SetBorder(false)
+
+	list := tview.NewList().ShowSecondaryText(false)
+
+	rebuild := func(text string) {
+		filtered = filtered[:0]
+		list.Clear()
+		for _, r := range all {
+			if fuzzyMatch(text, r.name) {
+				filtered = append(filtered, r)
+				list.AddItem(r.name, "", 0, nil)
+			}
+		}
+	}
+	rebuild("")
+
+	navigate := func() {
+		idx := list.GetCurrentItem()
+		if idx < 0 || idx >= len(filtered) {
+			return
+		}
+		r := filtered[idx]
+		s.pages.RemovePage(PageChatSearch)
+		treeView.SetCurrentNode(r.node)
+		if len(r.ref.ids) > 0 {
+			r.ref.isUnread = false
+			r.node.SetText(formatChatTreeTitle(r.ref.title, false))
+			r.node.SetReference(r.ref)
+			s.components[ViChat].(*tview.List).
+				SetTitle(r.ref.title).SetBorder(true).SetTitleAlign(tview.AlignCenter)
+			s.setActiveConversation(r.node, r.ref.ids, r.ref.title)
+			go s.loadConversationsByIDs(r.node, r.ref.ids, r.ref.title)
+		}
+	}
+
+	input.SetChangedFunc(func(text string) { rebuild(text) })
+	input.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEscape:
+			s.pages.RemovePage(PageChatSearch)
+			return nil
+		case tcell.KeyEnter:
+			navigate()
+			return nil
+		case tcell.KeyDown, tcell.KeyTab:
+			s.app.SetFocus(list)
+			return nil
+		}
+		return event
+	})
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEscape:
+			s.pages.RemovePage(PageChatSearch)
+			return nil
+		case tcell.KeyEnter:
+			navigate()
+			return nil
+		case tcell.KeyUp:
+			if list.GetCurrentItem() == 0 {
+				s.app.SetFocus(input)
+				return nil
+			}
+		}
+		return event
+	})
+
+	pane := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(input, 1, 0, true).
+		AddItem(list, 0, 1, false)
+	pane.SetBorder(true).SetTitle(" Find Chat (Esc to close) ").SetTitleAlign(tview.AlignCenter)
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(pane, 20, 1, true).
+			AddItem(nil, 0, 1, false), 50, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	s.pages.AddPage(PageChatSearch, modal, true, true)
+	s.app.SetFocus(input)
+}
+
+func (s *AppState) showMessageSearchModal() {
+	s.chatMessagesMu.RLock()
+	msgs := append([]csa.ChatMessage(nil), s.chatMessages...)
+	s.chatMessagesMu.RUnlock()
+
+	if len(msgs) == 0 {
+		return
+	}
+
+	type msgResult struct {
+		idx     int
+		preview string
+		author  string
+	}
+	all := make([]msgResult, 0, len(msgs))
+	for i, m := range msgs {
+		author := strings.TrimSpace(m.ImDisplayName)
+		if author == "" {
+			author = inferMessageAuthor(m, s.me)
+		}
+		preview := strings.Join(strings.Fields(textMessage(m.Content)), " ")
+		if len(preview) > 80 {
+			preview = preview[:80]
+		}
+		all = append(all, msgResult{idx: i, preview: preview, author: author})
+	}
+
+	var filtered []msgResult
+	chatList := s.components[ViChat].(*tview.List)
+
+	input := tview.NewInputField().SetLabel("/ ").SetFieldWidth(0)
+	list := tview.NewList().ShowSecondaryText(true)
+
+	rebuild := func(text string) {
+		filtered = filtered[:0]
+		list.Clear()
+		for _, r := range all {
+			if fuzzyMatch(text, r.preview) || fuzzyMatch(text, r.author) {
+				filtered = append(filtered, r)
+				list.AddItem(r.preview, r.author, 0, nil)
+			}
+		}
+	}
+	rebuild("")
+
+	jump := func() {
+		idx := list.GetCurrentItem()
+		if idx < 0 || idx >= len(filtered) {
+			return
+		}
+		msgIdx := filtered[idx].idx
+		s.pages.RemovePage(PageMsgSearch)
+
+		// Find the list row that maps to this message index
+		s.chatMessagesMu.RLock()
+		rowMap := append([]int(nil), s.chatRowMap...)
+		s.chatMessagesMu.RUnlock()
+		for row, mi := range rowMap {
+			if mi == msgIdx {
+				chatList.SetCurrentItem(row)
+				break
+			}
+		}
+	}
+
+	input.SetChangedFunc(func(text string) { rebuild(text) })
+	input.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEscape:
+			s.pages.RemovePage(PageMsgSearch)
+			return nil
+		case tcell.KeyEnter:
+			jump()
+			return nil
+		case tcell.KeyDown, tcell.KeyTab:
+			s.app.SetFocus(list)
+			return nil
+		}
+		return event
+	})
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEscape:
+			s.pages.RemovePage(PageMsgSearch)
+			return nil
+		case tcell.KeyEnter:
+			jump()
+			return nil
+		case tcell.KeyUp:
+			if list.GetCurrentItem() == 0 {
+				s.app.SetFocus(input)
+				return nil
+			}
+		}
+		return event
+	})
+
+	pane := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(input, 1, 0, true).
+		AddItem(list, 0, 1, false)
+	pane.SetBorder(true).SetTitle(" Find Message (Esc to close) ").SetTitleAlign(tview.AlignCenter)
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(pane, 22, 1, true).
+			AddItem(nil, 0, 1, false), 72, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	s.pages.AddPage(PageMsgSearch, modal, true, true)
+	s.app.SetFocus(input)
 }
 
 func (s *AppState) setActiveConversation(selectedNode *tview.TreeNode, conversationIDs []string, title string) {
