@@ -16,6 +16,7 @@
     "axios": "^0.21.1",
     "carbonyl": "^0.0.2-next.bacf3db",
     "jsonwebtoken": "^9.0.3",
+    "node-pty": "^1.1.0",
     "puppeteer-core": "^25.1.0",
     "uuid": "^8.3.2"
   },

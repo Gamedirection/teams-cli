@@ -1,5 +1,5 @@
 import puppeteer, { Browser, Page, Frame } from 'puppeteer-core';
-import { spawn } from 'child_process';
+import * as pty from 'node-pty';
 import { homedir } from 'os';
 import { writeFileSync, existsSync, mkdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
@@ -141,17 +141,40 @@ const log = (msg: string) => process.stderr.write(msg + '\n');
 async function main() {
   const initialURL = getLoginURL('teams', 'common');
 
-  // Pass initial URL so Carbonyl starts rendering immediately instead of blank
-  const proc = spawn(carbonylBin, [
+  // Use node-pty so Carbonyl gets a real PTY — raw mode, keyboard, resize all work
+  const term = pty.spawn(carbonylBin, [
     `--remote-debugging-port=${DEBUG_PORT}`,
     '--no-sandbox',
     '--disable-setuid-sandbox',
     initialURL,
-  ], { stdio: 'inherit' });
+  ], {
+    name: process.env.TERM || 'xterm-256color',
+    cols: process.stdout.columns || 220,
+    rows: process.stdout.rows || 50,
+    env: process.env as Record<string, string>,
+  });
 
-  proc.on('error', (err) => { log('Failed to start Carbonyl: ' + err.message); process.exit(1); });
+  // Forward PTY output → terminal
+  term.onData((data: string) => process.stdout.write(data));
 
-  const cleanup = () => { try { proc.kill(); } catch { /* ignore */ } };
+  // Forward terminal input → PTY
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on('data', (chunk: Buffer) => term.write(chunk.toString()));
+  }
+
+  // Forward terminal resize → PTY
+  process.stdout.on('resize', () => {
+    term.resize(process.stdout.columns || 220, process.stdout.rows || 50);
+  });
+
+  const cleanup = () => {
+    try { term.kill(); } catch { /* ignore */ }
+    if (process.stdin.isTTY) {
+      try { process.stdin.setRawMode(false); } catch { /* ignore */ }
+    }
+  };
   process.on('exit', cleanup);
   process.on('SIGINT', () => { cleanup(); process.exit(0); });
   process.on('SIGTERM', () => { cleanup(); process.exit(0); });
