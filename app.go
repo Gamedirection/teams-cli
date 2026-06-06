@@ -98,6 +98,9 @@ type AppState struct {
 	contactCandidates   []mentionCandidate
 	contactsLastFetched time.Time
 
+	presenceMu sync.RWMutex
+	presence   map[string]string // mri → availability e.g. "Available","Busy","Away","Offline"
+
 	chatWordWrapMu    sync.RWMutex
 	chatWordWrap      bool
 	chatWrapChars     int
@@ -234,6 +237,7 @@ func (s *AppState) createApp() {
 	s.unreadScanStop = make(chan struct{})
 	s.manualUnread = map[string]bool{}
 	s.messageReactions = map[string]string{}
+	s.presence = map[string]string{}
 	s.chatWordWrap = true
 	s.chatMarkdown = true
 	s.chatWrapChars = 80
@@ -1115,6 +1119,89 @@ func (s *AppState) fillMainWindow() {
 	s.app.Draw()
 	s.startUnreadScanLoop(chatsNode)
 	s.logger.Info("main window ready")
+
+	// Fetch presence for all DM members in the background
+	go s.refreshAllPresence(chatsNode)
+}
+
+func (s *AppState) refreshAllPresence(chatsNode *tview.TreeNode) {
+	if s.conversations.Chats == nil {
+		return
+	}
+	mriSet := map[string]bool{}
+	mriToNodes := map[string][]*tview.TreeNode{}
+	for _, chat := range s.conversations.Chats {
+		if !chat.IsOneOnOne {
+			continue
+		}
+		for _, m := range chat.Members {
+			mri := strings.ToLower(strings.TrimSpace(m.Mri))
+			if mri == "" {
+				continue
+			}
+			if s.me != nil && strings.ToLower(s.me.Mri) == mri {
+				continue
+			}
+			mriSet[mri] = true
+		}
+	}
+	if len(mriSet) == 0 {
+		return
+	}
+	mris := make([]string, 0, len(mriSet))
+	for mri := range mriSet {
+		mris = append(mris, mri)
+	}
+	s.fetchPresenceBatch(mris)
+
+	// Map chatKey → primary member MRI for DM chats
+	chatKeyToMRI := map[string]string{}
+	for _, chat := range s.conversations.Chats {
+		if !chat.IsOneOnOne {
+			continue
+		}
+		candidateIDs := candidateConversationIds(chat, s.conversations.PrivateFeeds)
+		chatKey := chatFavoriteKey(chat.Id, candidateIDs)
+		for _, m := range chat.Members {
+			mri := strings.ToLower(strings.TrimSpace(m.Mri))
+			if s.me != nil && strings.ToLower(s.me.Mri) == mri {
+				continue
+			}
+			chatKeyToMRI[chatKey] = mri
+			break
+		}
+	}
+
+	// Build reverse map: chatKey → tree nodes across all sections
+	_ = mriToNodes
+	walkNodes(chatsNode, func(node *tview.TreeNode) {
+		ref, ok := node.GetReference().(conversationRef)
+		if !ok || ref.chatKey == "" {
+			return
+		}
+		mri, hasMRI := chatKeyToMRI[ref.chatKey]
+		if !hasMRI {
+			return
+		}
+		avail := s.getPresence(mri)
+		if avail == "" {
+			return
+		}
+		dot := presenceDot(avail)
+		if dot == "" {
+			return
+		}
+		newText := dot + " " + formatChatTreeTitle(ref.title, ref.isUnread)
+		node.SetText(newText)
+	})
+	s.app.QueueUpdateDraw(func() {})
+}
+
+func walkNodes(node *tview.TreeNode, fn func(*tview.TreeNode)) {
+	fn(node)
+	for _, child := range node.GetChildren() {
+		walkNodes(child, fn)
+	}
 }
 
 func (s *AppState) setActiveConversation(selectedNode *tview.TreeNode, conversationIDs []string, title string) {
@@ -2993,6 +3080,84 @@ func (s *AppState) formatMessageReactionsOnly(message csa.ChatMessage) string {
 		parts = append(parts, reactionToEmoji(local))
 	}
 	return strings.Join(parts, ", ")
+}
+
+func presenceDot(availability string) string {
+	switch strings.ToLower(strings.TrimSpace(availability)) {
+	case "available":
+		return "[green]●[-]"
+	case "busy", "donotdisturb":
+		return "[red]●[-]"
+	case "away", "beRightBack", "berightback":
+		return "[yellow]●[-]"
+	case "outofoffice":
+		return "[#9b59b6]●[-]"
+	case "offline", "presenceunknown":
+		return "[gray]○[-]"
+	default:
+		return ""
+	}
+}
+
+func (s *AppState) getPresence(mri string) string {
+	s.presenceMu.RLock()
+	v := s.presence[strings.ToLower(strings.TrimSpace(mri))]
+	s.presenceMu.RUnlock()
+	return v
+}
+
+func (s *AppState) fetchPresenceBatch(mris []string) {
+	if len(mris) == 0 {
+		return
+	}
+	home := os.Getenv("HOME")
+	configDir := filepath.Join(home, ".config", "fossteams")
+
+	// Get short skype token for presence API
+	shortToken := s.fetchShortSkypeToken(configDir)
+	if shortToken == "" {
+		return
+	}
+
+	type presReq struct {
+		Mris []string `json:"mris"`
+	}
+	body, _ := json.Marshal(presReq{Mris: mris})
+
+	req, err := http.NewRequest("POST",
+		"https://presence.teams.microsoft.com/v1/presence/getbulkpresence",
+		bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authentication", "skypetoken="+shortToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Mris []struct {
+			Mri      string `json:"mri"`
+			Presence struct {
+				Availability string `json:"availability"`
+			} `json:"presence"`
+		} `json:"mris"`
+	}
+	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return
+	}
+
+	s.presenceMu.Lock()
+	for _, item := range result.Mris {
+		if item.Mri != "" {
+			s.presence[strings.ToLower(item.Mri)] = item.Presence.Availability
+		}
+	}
+	s.presenceMu.Unlock()
 }
 
 func reactionToEmoji(name string) string {
