@@ -3334,16 +3334,13 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 		if shortToken == "" {
 			return "", fmt.Errorf("unable to get skype token for image download")
 		}
-		spacesBearerJWT := ""
-		if data, e := os.ReadFile(filepath.Join(configDir, "token-skype.jwt")); e == nil {
-			spacesBearerJWT = strings.TrimSpace(string(data))
-		}
+		// DO NOT send Authorization: Bearer — it overrides the cookie auth and causes 401.
+		// Only skypetoken_asm cookie + Authentication header needed.
 		args := []string{
-			"-L", "--verbose",
+			"-L", "-s",
 			"-o", destPath,
 			"--cookie", "skypetoken_asm=" + shortToken,
 			"-H", "Authentication: skypetoken=" + shortToken,
-			"-H", "Authorization: Bearer " + spacesBearerJWT,
 			"--max-time", "30",
 			imageURL,
 		}
@@ -3363,12 +3360,7 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 			if len(snippet) > 200 {
 				snippet = snippet[:200]
 			}
-			// Include curl verbose output (HTTP status visible in there)
-			verboseSnip := string(curlOut)
-			if len(verboseSnip) > 500 {
-				verboseSnip = verboseSnip[len(verboseSnip)-500:]
-			}
-			return "", fmt.Errorf("image download failed (%d bytes)\nbody: %s\ncurl: %s", size, snippet, verboseSnip)
+			return "", fmt.Errorf("image download failed (%d bytes): %s", size, snippet)
 		}
 		return destPath, nil
 	}
