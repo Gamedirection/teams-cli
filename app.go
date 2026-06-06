@@ -3582,6 +3582,7 @@ func (s *AppState) openImageInTerminal(item linkItem) {
 		defer func() { recover() }() //nolint
 		rendered, err := s.renderImageChafa(item.url)
 		s.app.QueueUpdateDraw(func() {
+			defer func() { recover() }() //nolint — protect main goroutine from ANSIWriter panics
 			if composeView != nil {
 				composeView.SetTitle(s.composeTitleWithScanStatus())
 			}
@@ -3591,12 +3592,16 @@ func (s *AppState) openImageInTerminal(item linkItem) {
 				}
 				return
 			}
+			// Strip cursor-hide/show and other private ANSI sequences chafa emits
+			// that tview.ANSIWriter cannot handle ([?25l, [?25h, etc.)
+			privateSeqRe := regexp.MustCompile(`\x1b\[[?][0-9;]*[a-zA-Z]`)
+			clean := privateSeqRe.ReplaceAllString(rendered, "")
+
 			tv := tview.NewTextView().
 				SetDynamicColors(true).
 				SetScrollable(true)
-			// Write chafa ANSI output through ANSIWriter so escape codes render
 			w := tview.ANSIWriter(tv)
-			fmt.Fprint(w, rendered)
+			fmt.Fprint(w, clean)
 			tv.SetBorder(true).SetTitle(" "+item.text+" (Esc to close) ").SetTitleAlign(tview.AlignCenter)
 			tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 				if event.Key() == tcell.KeyEscape {
