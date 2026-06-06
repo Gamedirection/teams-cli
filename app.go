@@ -3147,30 +3147,29 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	home := os.Getenv("HOME")
-	configDir := filepath.Join(home, ".config", "fossteams")
-
-	skypeData, _ := os.ReadFile(filepath.Join(configDir, "token-skype.jwt"))
-	teamsData, _ := os.ReadFile(filepath.Join(configDir, "token-teams.jwt"))
-	skypeToken := strings.TrimSpace(string(skypeData))
-	teamsToken := strings.TrimSpace(string(teamsData))
-
-	// Teams media CDN (asyncgw, ng.msg.teams) uses skypetoken auth scheme:
-	//   Authentication: skypetoken=<raw_jwt>
-	// Other URLs use standard Bearer token.
+	// Teams media CDN requires the short skype token from the authz exchange,
+	// NOT the raw Azure AD JWT from token-skype.jwt.
+	// api.GetSkypeToken() performs the /authsvc/v1.0/authz exchange automatically.
 	isMediaCDN := strings.Contains(imageURL, "asyncgw.teams.microsoft.com") ||
 		strings.Contains(imageURL, "ng.msg.teams.microsoft.com") ||
 		strings.Contains(imageURL, "statics.teams.cdn") ||
 		strings.Contains(imageURL, "teams.microsoft.com/v1/objects")
-	if isMediaCDN && skypeToken != "" {
-		req.Header.Set("Authentication", "skypetoken="+skypeToken)
-		if teamsToken != "" {
-			req.Header.Set("Authorization", "Bearer "+teamsToken)
+
+	if isMediaCDN {
+		if skypeToken, skypeErr := api.GetSkypeToken(); skypeErr == nil {
+			// Authentication: skypetoken=<short_token>  (custom Teams CDN header)
+			req.Header.Set("Authentication", api.AuthString(skypeToken))
 		}
-	} else if teamsToken != "" {
-		req.Header.Set("Authorization", "Bearer "+teamsToken)
-	} else if skypeToken != "" {
-		req.Header.Set("Authorization", "Bearer "+skypeToken)
+		// Also send the spaces token as Authorization Bearer for good measure
+		if spacesToken, spacesErr := api.GetSkypeSpacesToken(); spacesErr == nil {
+			req.Header.Set("Authorization", "Bearer "+spacesToken.Inner.Raw)
+		}
+	} else {
+		// Public/external image: use standard Bearer
+		home := os.Getenv("HOME")
+		if teamsData, e := os.ReadFile(filepath.Join(home, ".config", "fossteams", "token-teams.jwt")); e == nil {
+			req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(teamsData)))
+		}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
