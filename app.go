@@ -3940,7 +3940,7 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 	// Clear chat
 	chatList := s.components[ViChat].(*tview.List)
 	chatList.Clear()
-	chatList.ShowSecondaryText(true)
+	chatList.ShowSecondaryText(false)
 	chatList.SetSelectedFunc(nil)
 	chatList.SetChangedFunc(nil)
 	s.setCurrentChatMessages(messages)
@@ -3969,35 +3969,69 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 	s.chatWordWrapMu.Lock()
 	s.chatWrapEffective = wrapWidth
 	s.chatWordWrapMu.Unlock()
-	for msgIdx, message := range messages {
-		author := strings.TrimSpace(message.ImDisplayName)
-		if author == "" {
-			author = inferMessageAuthor(message, s.me)
-		}
-		if s.isChatWordWrap() {
-			lines := wrapTextLines(textMessage(message.Content), wrapWidth)
-			if len(lines) == 0 {
-				lines = []string{""}
+
+	if len(messages) == 0 {
+		chatList.AddItem("[darkgray]No messages yet.[-]", "", 0, nil)
+	} else {
+		for msgIdx, message := range messages {
+			author := strings.TrimSpace(message.ImDisplayName)
+			if author == "" {
+				author = inferMessageAuthor(message, s.me)
 			}
-			secondary := s.formatMessageSecondary(message, author)
-			for i, line := range lines {
-				lineSecondary := ""
-				if i == 0 {
-					lineSecondary = secondary
+
+			// Timestamp
+			ts := time.Time(message.OriginalArrivalTime)
+			if ts.IsZero() {
+				ts = time.Time(message.ComposeTime)
+			}
+			timeStr := ""
+			if !ts.IsZero() {
+				timeStr = fmt.Sprintf("  [#555555]%s[-]", ts.Local().Format("3:04 PM"))
+			}
+
+			// Reactions
+			reactions := s.formatMessageReactionsOnly(message)
+			reactStr := ""
+			if reactions != "" {
+				reactStr = fmt.Sprintf("  [gray]%s[-]", reactions)
+			}
+
+			// Header: Author  HH:MM  reactions
+			headerLine := fmt.Sprintf("[%s]%s[-]%s%s", s.authorStyleTag(), author, timeStr, reactStr)
+			chatList.AddItem(headerLine, "", 0, nil)
+			rowMap = append(rowMap, msgIdx)
+
+			// Content lines (indented)
+			if s.isChatWordWrap() {
+				lines := wrapTextLines(textMessage(message.Content), wrapWidth-2)
+				if len(lines) == 0 {
+					lines = []string{""}
 				}
-				chatList.AddItem(line, lineSecondary, 0, nil)
+				for _, line := range lines {
+					chatList.AddItem("  "+line, "", 0, nil)
+					rowMap = append(rowMap, msgIdx)
+				}
+			} else {
+				chatList.AddItem("  "+s.formatChatMessageText(message.Content), "", 0, nil)
 				rowMap = append(rowMap, msgIdx)
 			}
-		} else {
-			chatList.AddItem(s.formatChatMessageText(message.Content), s.formatMessageSecondary(message, author), 0, nil)
-			rowMap = append(rowMap, msgIdx)
+
+			// Blank line between messages
+			if msgIdx < len(messages)-1 {
+				chatList.AddItem("", "", 0, nil)
+				rowMap = append(rowMap, msgIdx)
+			}
 		}
 	}
+
 	s.setCurrentChatRowMap(rowMap)
-	if chatList.GetItemCount() > 0 {
-		chatList.SetCurrentItem(chatList.GetItemCount() - 1)
-	}
 	s.app.Draw()
+	s.app.QueueUpdateDraw(func() {
+		n := chatList.GetItemCount()
+		if n > 0 {
+			chatList.SetCurrentItem(n - 1)
+		}
+	})
 }
 
 func inferMessageAuthor(message csa.ChatMessage, me *models.User) string {
