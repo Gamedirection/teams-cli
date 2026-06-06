@@ -3339,22 +3339,36 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 			spacesBearerJWT = strings.TrimSpace(string(data))
 		}
 		args := []string{
-			"-s", "-L", "-o", destPath,
+			"-L", "--verbose",
+			"-o", destPath,
 			"--cookie", "skypetoken_asm=" + shortToken,
 			"-H", "Authentication: skypetoken=" + shortToken,
 			"-H", "Authorization: Bearer " + spacesBearerJWT,
 			"--max-time", "30",
 			imageURL,
 		}
-		out, curlErr := exec.Command("curl", args...).CombinedOutput()
+		curlOut, curlErr := exec.Command("curl", args...).CombinedOutput()
 		if curlErr != nil {
-			return "", fmt.Errorf("curl: %v — %s", curlErr, strings.TrimSpace(string(out)))
+			return "", fmt.Errorf("curl failed: %v\n%s", curlErr, strings.TrimSpace(string(curlOut)))
 		}
-		// Verify we got actual image data (not an error HTML page)
-		if info, statErr := os.Stat(destPath); statErr != nil || info.Size() < 512 {
+		info, statErr := os.Stat(destPath)
+		size := int64(0)
+		if statErr == nil {
+			size = info.Size()
+		}
+		if size < 512 {
 			content, _ := os.ReadFile(destPath)
 			os.Remove(destPath)
-			return "", fmt.Errorf("image download failed (got %d bytes): %s", len(content), strings.TrimSpace(string(content))[:min(len(content), 200)])
+			snippet := strings.TrimSpace(string(content))
+			if len(snippet) > 200 {
+				snippet = snippet[:200]
+			}
+			// Include curl verbose output (HTTP status visible in there)
+			verboseSnip := string(curlOut)
+			if len(verboseSnip) > 500 {
+				verboseSnip = verboseSnip[len(verboseSnip)-500:]
+			}
+			return "", fmt.Errorf("image download failed (%d bytes)\nbody: %s\ncurl: %s", size, snippet, verboseSnip)
 		}
 		return destPath, nil
 	}
