@@ -105,6 +105,16 @@ type AppState struct {
 	themeMu          sync.RWMutex
 	composeColorName string
 	authorColorName  string
+
+	groupsMu      sync.RWMutex
+	groups        map[string][]string
+	groupOrder    []string
+
+	treeNodesMu   sync.Mutex
+	chatsTreeNode  *tview.TreeNode
+	favTreeNode    *tview.TreeNode
+	recentTreeNode *tview.TreeNode
+	groupTreeNodes map[string]*tview.TreeNode
 }
 
 type conversationRef struct {
@@ -113,6 +123,10 @@ type conversationRef struct {
 	chatKey    string
 	isFavorite bool
 	isUnread   bool
+}
+
+type groupHeaderRef struct {
+	name string
 }
 
 type replyTarget struct {
@@ -142,14 +156,16 @@ type encryptedSettingsFile struct {
 }
 
 type persistedChatSettings struct {
-	Favorites       map[string]bool   `json:"favorites"`
-	Titles          map[string]string `json:"titles"`
-	UnreadOverrides map[string]bool   `json:"unread_overrides,omitempty"`
-	ChatWordWrap    *bool             `json:"chat_word_wrap,omitempty"`
-	ChatWrapPercent *int              `json:"chat_wrap_percent,omitempty"`
-	ChatWrapChars   *int              `json:"chat_wrap_chars,omitempty"`
-	ComposeColor    string            `json:"compose_color,omitempty"`
-	AuthorColor     string            `json:"author_color,omitempty"`
+	Favorites       map[string]bool     `json:"favorites"`
+	Titles          map[string]string   `json:"titles"`
+	UnreadOverrides map[string]bool     `json:"unread_overrides,omitempty"`
+	ChatWordWrap    *bool               `json:"chat_word_wrap,omitempty"`
+	ChatWrapPercent *int                `json:"chat_wrap_percent,omitempty"`
+	ChatWrapChars   *int                `json:"chat_wrap_chars,omitempty"`
+	ComposeColor    string              `json:"compose_color,omitempty"`
+	AuthorColor     string              `json:"author_color,omitempty"`
+	Groups          map[string][]string `json:"groups,omitempty"`
+	GroupOrder      []string            `json:"group_order,omitempty"`
 }
 
 type keybindingConfigFile struct {
@@ -202,6 +218,9 @@ func (s *AppState) createApp() {
 	s.components = map[string]tview.Primitive{}
 	s.chatFavorites = map[string]bool{}
 	s.chatTitles = map[string]string{}
+	s.groups = map[string][]string{}
+	s.groupOrder = []string{}
+	s.groupTreeNodes = map[string]*tview.TreeNode{}
 	s.unreadScanEnabled = true
 	s.unreadScanInterval = time.Minute
 	s.unreadScanStop = make(chan struct{})
@@ -546,6 +565,7 @@ func (s *AppState) fillMainWindow() {
 	recentNode := tview.NewTreeNode("Recent")
 	recentNode.SetColor(tcell.ColorYellow)
 
+	newGroupNodes := map[string]*tview.TreeNode{}
 	var firstNode *tview.TreeNode
 	var mostRecentChatNode *tview.TreeNode
 	for _, t := range s.conversations.Teams {
@@ -622,15 +642,39 @@ func (s *AppState) fillMainWindow() {
 			favoritesNode.AddChild(chatNode)
 			continue
 		}
+		if gName := s.chatGroupName(chatKey); gName != "" {
+			if _, ok := newGroupNodes[gName]; !ok {
+				gn := tview.NewTreeNode(gName)
+				gn.SetColor(tcell.ColorLightCyan)
+				gn.SetReference(groupHeaderRef{name: gName})
+				newGroupNodes[gName] = gn
+			}
+			newGroupNodes[gName].AddChild(chatNode)
+			continue
+		}
 		recentNode.AddChild(chatNode)
 	}
+	s.groupsMu.RLock()
+	groupOrderCopy := append([]string(nil), s.groupOrder...)
+	s.groupsMu.RUnlock()
 	if len(favoritesNode.GetChildren()) > 0 {
 		chatsNode.AddChild(favoritesNode)
+	}
+	for _, gName := range groupOrderCopy {
+		if gn, ok := newGroupNodes[gName]; ok && len(gn.GetChildren()) > 0 {
+			chatsNode.AddChild(gn)
+		}
 	}
 	if len(recentNode.GetChildren()) > 0 {
 		chatsNode.AddChild(recentNode)
 	}
 	rootNode.AddChild(chatsNode)
+	s.treeNodesMu.Lock()
+	s.chatsTreeNode = chatsNode
+	s.favTreeNode = favoritesNode
+	s.recentTreeNode = recentNode
+	s.groupTreeNodes = newGroupNodes
+	s.treeNodesMu.Unlock()
 	settingsNode := tview.NewTreeNode("Settings & Help")
 	settingsNode.SetColor(tcell.ColorLightSkyBlue)
 	settingsNode.SetReference(conversationRef{
@@ -765,6 +809,21 @@ func (s *AppState) fillMainWindow() {
 		}
 		if s.bindingMatches(actionToggleFavorite, event) {
 			if s.toggleFavoriteForCurrentNode(treeView, chatsNode, favoritesNode, recentNode) {
+				return nil
+			}
+			return event
+		}
+		if event.Key() == tcell.KeyRune && event.Rune() == 'g' {
+			selected := treeView.GetCurrentNode()
+			if selected == nil {
+				return event
+			}
+			if ref, ok := selected.GetReference().(conversationRef); ok && strings.TrimSpace(ref.chatKey) != "" && ref.chatKey != settingsHelpChatKey {
+				s.showGroupPickerModal(selected, ref)
+				return nil
+			}
+			if gref, ok := selected.GetReference().(groupHeaderRef); ok {
+				s.showGroupManageModal(gref.name)
 				return nil
 			}
 			return event
@@ -1489,6 +1548,7 @@ func (s *AppState) createHelpModal() tview.Primitive {
 				"  ?                 toggle this help\n\n" +
 				"[green]Tree pane[-]\n" +
 				"  " + key(actionToggleFavorite) + "                   toggle favorite\n" +
+				"  g                   move to group / manage group\n" +
 				"  " + key(actionRefreshTitles) + "                   refresh chat titles\n" +
 				"  " + key(actionMarkUnread) + "                   mark chat unread\n" +
 				"  " + key(actionToggleScan) + "                   toggle unread scan\n" +
@@ -1817,9 +1877,402 @@ func (s *AppState) toggleFavoriteForCurrentNode(treeView *tview.TreeView, chatsN
 	}
 	ref.isFavorite = s.toggleChatFavorite(ref.chatKey, ref.isFavorite)
 	selected.SetReference(ref)
-	moveChatNodeToGroup(chatsNode, favoritesNode, recentNode, selected, ref.isFavorite)
+	s.moveChatNodeToGroup(chatsNode, favoritesNode, recentNode, selected, ref.isFavorite)
 	treeView.SetCurrentNode(selected)
 	return true
+}
+
+func (s *AppState) chatGroupName(chatKey string) string {
+	key := normalizeFavoriteKey(chatKey)
+	if key == "" {
+		return ""
+	}
+	s.groupsMu.RLock()
+	defer s.groupsMu.RUnlock()
+	for groupName, keys := range s.groups {
+		for _, k := range keys {
+			if normalizeFavoriteKey(k) == key {
+				return groupName
+			}
+		}
+	}
+	return ""
+}
+
+func (s *AppState) addChatToGroup(chatKey, groupName string) {
+	key := normalizeFavoriteKey(chatKey)
+	if key == "" || groupName == "" {
+		return
+	}
+	s.groupsMu.Lock()
+	defer s.groupsMu.Unlock()
+	for gn, keys := range s.groups {
+		filtered := keys[:0]
+		for _, k := range keys {
+			if normalizeFavoriteKey(k) != key {
+				filtered = append(filtered, k)
+			}
+		}
+		s.groups[gn] = filtered
+	}
+	if _, ok := s.groups[groupName]; !ok {
+		s.groups[groupName] = []string{}
+		s.groupOrder = append(s.groupOrder, groupName)
+	}
+	s.groups[groupName] = append(s.groups[groupName], key)
+}
+
+func (s *AppState) removeChatFromGroupData(chatKey string) {
+	key := normalizeFavoriteKey(chatKey)
+	if key == "" {
+		return
+	}
+	s.groupsMu.Lock()
+	defer s.groupsMu.Unlock()
+	for gn, keys := range s.groups {
+		filtered := []string{}
+		for _, k := range keys {
+			if normalizeFavoriteKey(k) != key {
+				filtered = append(filtered, k)
+			}
+		}
+		s.groups[gn] = filtered
+	}
+}
+
+func (s *AppState) renameGroupData(oldName, newName string) {
+	s.groupsMu.Lock()
+	defer s.groupsMu.Unlock()
+	keys, ok := s.groups[oldName]
+	if !ok {
+		return
+	}
+	if _, exists := s.groups[newName]; exists {
+		return
+	}
+	s.groups[newName] = keys
+	delete(s.groups, oldName)
+	for i, name := range s.groupOrder {
+		if name == oldName {
+			s.groupOrder[i] = newName
+			break
+		}
+	}
+}
+
+func (s *AppState) deleteGroupData(groupName string) {
+	s.groupsMu.Lock()
+	defer s.groupsMu.Unlock()
+	delete(s.groups, groupName)
+	filtered := []string{}
+	for _, name := range s.groupOrder {
+		if name != groupName {
+			filtered = append(filtered, name)
+		}
+	}
+	s.groupOrder = filtered
+}
+
+func (s *AppState) rebuildChatsNodeChildren() {
+	s.treeNodesMu.Lock()
+	chatsNode := s.chatsTreeNode
+	favNode := s.favTreeNode
+	recentNode := s.recentTreeNode
+	groupNodes := s.groupTreeNodes
+	s.treeNodesMu.Unlock()
+	if chatsNode == nil {
+		return
+	}
+	s.groupsMu.RLock()
+	groupOrder := append([]string(nil), s.groupOrder...)
+	s.groupsMu.RUnlock()
+	chatsNode.ClearChildren()
+	if favNode != nil && len(favNode.GetChildren()) > 0 {
+		chatsNode.AddChild(favNode)
+	}
+	for _, name := range groupOrder {
+		if gn, ok := groupNodes[name]; ok && len(gn.GetChildren()) > 0 {
+			chatsNode.AddChild(gn)
+		}
+	}
+	if recentNode != nil && len(recentNode.GetChildren()) > 0 {
+		chatsNode.AddChild(recentNode)
+	}
+}
+
+func (s *AppState) moveChatToGroupNode(chatNode *tview.TreeNode, chatKey, groupName string) {
+	s.treeNodesMu.Lock()
+	recentNode := s.recentTreeNode
+	favNode := s.favTreeNode
+	groupNodes := s.groupTreeNodes
+	s.treeNodesMu.Unlock()
+
+	if favNode != nil {
+		favNode.RemoveChild(chatNode)
+	}
+	if recentNode != nil {
+		recentNode.RemoveChild(chatNode)
+	}
+	for _, gn := range groupNodes {
+		gn.RemoveChild(chatNode)
+	}
+
+	s.addChatToGroup(chatKey, groupName)
+
+	s.treeNodesMu.Lock()
+	var targetNode *tview.TreeNode
+	if gn, ok := s.groupTreeNodes[groupName]; ok {
+		targetNode = gn
+	} else {
+		gn = tview.NewTreeNode(groupName)
+		gn.SetColor(tcell.ColorLightCyan)
+		gn.SetReference(groupHeaderRef{name: groupName})
+		s.groupTreeNodes[groupName] = gn
+		targetNode = gn
+	}
+	s.treeNodesMu.Unlock()
+
+	targetNode.AddChild(chatNode)
+	s.rebuildChatsNodeChildren()
+	s.persistEncryptedChatSettings()
+}
+
+func (s *AppState) removeChatFromGroupNode(chatNode *tview.TreeNode, chatKey string) {
+	s.treeNodesMu.Lock()
+	recentNode := s.recentTreeNode
+	groupNodes := s.groupTreeNodes
+	s.treeNodesMu.Unlock()
+
+	for _, gn := range groupNodes {
+		gn.RemoveChild(chatNode)
+	}
+	if recentNode != nil {
+		recentNode.AddChild(chatNode)
+	}
+
+	s.removeChatFromGroupData(chatKey)
+	s.rebuildChatsNodeChildren()
+	s.persistEncryptedChatSettings()
+}
+
+func (s *AppState) deleteGroupAndRebuild(groupName string) {
+	s.treeNodesMu.Lock()
+	recentNode := s.recentTreeNode
+	gn, hasNode := s.groupTreeNodes[groupName]
+	if hasNode {
+		delete(s.groupTreeNodes, groupName)
+	}
+	s.treeNodesMu.Unlock()
+
+	if hasNode && gn != nil && recentNode != nil {
+		for _, child := range gn.GetChildren() {
+			gn.RemoveChild(child)
+			recentNode.AddChild(child)
+		}
+	}
+
+	s.deleteGroupData(groupName)
+	s.rebuildChatsNodeChildren()
+	s.persistEncryptedChatSettings()
+}
+
+func (s *AppState) renameGroupAndRebuild(oldName, newName string) {
+	s.treeNodesMu.Lock()
+	if gn, ok := s.groupTreeNodes[oldName]; ok {
+		gn.SetText(newName)
+		gn.SetReference(groupHeaderRef{name: newName})
+		s.groupTreeNodes[newName] = gn
+		delete(s.groupTreeNodes, oldName)
+	}
+	s.treeNodesMu.Unlock()
+
+	s.renameGroupData(oldName, newName)
+	s.persistEncryptedChatSettings()
+}
+
+const (
+	pageGroupPicker = "pageGroupPicker"
+	pageGroupNew    = "pageGroupNew"
+	pageGroupManage = "pageGroupManage"
+	pageGroupRename = "pageGroupRename"
+)
+
+func (s *AppState) showGroupPickerModal(chatNode *tview.TreeNode, ref conversationRef) {
+	s.groupsMu.RLock()
+	groupOrder := append([]string(nil), s.groupOrder...)
+	s.groupsMu.RUnlock()
+
+	currentGroup := s.chatGroupName(ref.chatKey)
+
+	list := tview.NewList().ShowSecondaryText(false)
+	list.SetBorder(true).SetTitle(" Move to Group ").SetTitleAlign(tview.AlignCenter)
+
+	if currentGroup != "" {
+		list.AddItem("[ Remove from group ]", "", 0, func() {
+			s.pages.RemovePage(pageGroupPicker)
+			s.removeChatFromGroupNode(chatNode, ref.chatKey)
+		})
+	}
+
+	list.AddItem("[ + New group ]", "", 0, func() {
+		s.pages.RemovePage(pageGroupPicker)
+		s.showNewGroupModal(chatNode, ref)
+	})
+
+	for _, gName := range groupOrder {
+		if gName == currentGroup {
+			continue
+		}
+		gNameCopy := gName
+		list.AddItem(gNameCopy, "", 0, func() {
+			s.pages.RemovePage(pageGroupPicker)
+			s.moveChatToGroupNode(chatNode, ref.chatKey, gNameCopy)
+		})
+	}
+
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			s.pages.RemovePage(pageGroupPicker)
+			return nil
+		}
+		return event
+	})
+
+	height := len(groupOrder) + 5
+	if height > 15 {
+		height = 15
+	}
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(list, height, 1, true).
+			AddItem(nil, 0, 1, false), 44, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	s.pages.AddPage(pageGroupPicker, modal, true, true)
+	s.app.SetFocus(list)
+}
+
+func (s *AppState) showNewGroupModal(chatNode *tview.TreeNode, ref conversationRef) {
+	input := tview.NewInputField().SetLabel("Name: ").SetFieldWidth(28)
+
+	commit := func() {
+		name := strings.TrimSpace(input.GetText())
+		if name == "" {
+			return
+		}
+		s.pages.RemovePage(pageGroupNew)
+		s.moveChatToGroupNode(chatNode, ref.chatKey, name)
+	}
+
+	input.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEnter:
+			commit()
+			return nil
+		case tcell.KeyEscape:
+			s.pages.RemovePage(pageGroupNew)
+			return nil
+		}
+		return event
+	})
+
+	form := tview.NewForm().
+		AddFormItem(input).
+		AddButton("Create", commit).
+		AddButton("Cancel", func() { s.pages.RemovePage(pageGroupNew) })
+	form.SetBorder(true).SetTitle(" New Group ").SetTitleAlign(tview.AlignCenter)
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(form, 7, 1, true).
+			AddItem(nil, 0, 1, false), 50, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	s.pages.AddPage(pageGroupNew, modal, true, true)
+	s.app.SetFocus(input)
+}
+
+func (s *AppState) showGroupManageModal(groupName string) {
+	list := tview.NewList().ShowSecondaryText(false)
+	list.SetBorder(true).SetTitle(" "+groupName+" ").SetTitleAlign(tview.AlignCenter)
+
+	list.AddItem("Rename group", "", 0, func() {
+		s.pages.RemovePage(pageGroupManage)
+		s.showGroupRenameModal(groupName)
+	})
+	list.AddItem("Delete group", "", 0, func() {
+		s.pages.RemovePage(pageGroupManage)
+		s.deleteGroupAndRebuild(groupName)
+	})
+	list.AddItem("Cancel", "", 0, func() {
+		s.pages.RemovePage(pageGroupManage)
+	})
+
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			s.pages.RemovePage(pageGroupManage)
+			return nil
+		}
+		return event
+	})
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(list, 7, 1, true).
+			AddItem(nil, 0, 1, false), 44, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	s.pages.AddPage(pageGroupManage, modal, true, true)
+	s.app.SetFocus(list)
+}
+
+func (s *AppState) showGroupRenameModal(oldName string) {
+	input := tview.NewInputField().SetLabel("Name: ").SetFieldWidth(28).SetText(oldName)
+
+	commit := func() {
+		name := strings.TrimSpace(input.GetText())
+		if name == "" || name == oldName {
+			s.pages.RemovePage(pageGroupRename)
+			return
+		}
+		s.pages.RemovePage(pageGroupRename)
+		s.renameGroupAndRebuild(oldName, name)
+	}
+
+	input.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEnter:
+			commit()
+			return nil
+		case tcell.KeyEscape:
+			s.pages.RemovePage(pageGroupRename)
+			return nil
+		}
+		return event
+	})
+
+	form := tview.NewForm().
+		AddFormItem(input).
+		AddButton("Save", commit).
+		AddButton("Cancel", func() { s.pages.RemovePage(pageGroupRename) })
+	form.SetBorder(true).SetTitle(" Rename Group ").SetTitleAlign(tview.AlignCenter)
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(form, 7, 1, true).
+			AddItem(nil, 0, 1, false), 50, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	s.pages.AddPage(pageGroupRename, modal, true, true)
+	s.app.SetFocus(input)
 }
 
 func resolveDMDisplayName(currentName string, messages []csa.ChatMessage, me *models.User) string {
@@ -2382,12 +2835,18 @@ func flattenConversationNodes(root *tview.TreeNode) []*tview.TreeNode {
 	return nodes
 }
 
-func moveChatNodeToGroup(chatsNode, favoritesNode, recentNode, node *tview.TreeNode, favorite bool) {
+func (s *AppState) moveChatNodeToGroup(chatsNode, favoritesNode, recentNode, node *tview.TreeNode, favorite bool) {
 	if node == nil || chatsNode == nil || favoritesNode == nil || recentNode == nil {
 		return
 	}
 	favoritesNode.RemoveChild(node)
 	recentNode.RemoveChild(node)
+	s.treeNodesMu.Lock()
+	groupNodes := s.groupTreeNodes
+	s.treeNodesMu.Unlock()
+	for _, gn := range groupNodes {
+		gn.RemoveChild(node)
+	}
 
 	if favorite {
 		favoritesNode.AddChild(node)
@@ -2396,8 +2855,16 @@ func moveChatNodeToGroup(chatsNode, favoritesNode, recentNode, node *tview.TreeN
 	}
 
 	chatsNode.ClearChildren()
+	s.groupsMu.RLock()
+	groupOrder := append([]string(nil), s.groupOrder...)
+	s.groupsMu.RUnlock()
 	if len(favoritesNode.GetChildren()) > 0 {
 		chatsNode.AddChild(favoritesNode)
+	}
+	for _, name := range groupOrder {
+		if gn, ok := groupNodes[name]; ok && len(gn.GetChildren()) > 0 {
+			chatsNode.AddChild(gn)
+		}
 	}
 	if len(recentNode.GetChildren()) > 0 {
 		chatsNode.AddChild(recentNode)
@@ -3883,6 +4350,19 @@ func (s *AppState) loadEncryptedChatSettings() error {
 	}
 	s.manualUnreadMu.Unlock()
 
+	s.groupsMu.Lock()
+	if settings.Groups != nil {
+		s.groups = settings.Groups
+	} else {
+		s.groups = map[string][]string{}
+	}
+	if settings.GroupOrder != nil {
+		s.groupOrder = settings.GroupOrder
+	} else {
+		s.groupOrder = []string{}
+	}
+	s.groupsMu.Unlock()
+
 	s.chatWordWrapMu.Lock()
 	if settings.ChatWordWrap == nil {
 		s.chatWordWrap = true
@@ -3938,6 +4418,14 @@ func (s *AppState) persistEncryptedChatSettings() {
 		settings.UnreadOverrides[k] = v
 	}
 	s.manualUnreadMu.RUnlock()
+	settings.Groups = map[string][]string{}
+	settings.GroupOrder = []string{}
+	s.groupsMu.RLock()
+	for k, v := range s.groups {
+		settings.Groups[k] = append([]string(nil), v...)
+	}
+	settings.GroupOrder = append([]string(nil), s.groupOrder...)
+	s.groupsMu.RUnlock()
 	wrap := s.isChatWordWrap()
 	settings.ChatWordWrap = &wrap
 	wrapChars := s.getChatWrapPercent()
