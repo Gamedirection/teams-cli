@@ -120,8 +120,8 @@ async function authorize(page: Page, type: TeamsSkype, tenantId: string): Promis
   log(`Authorizing ${type} with tenantId=${tenantId}`);
   const redirectPromise = waitForRedirect(page);
   await page.setUserAgent(USER_AGENT);
-  // Don't await goto — it may never resolve because we intercept the redirect
-  page.goto(getLoginURL(type, tenantId)).catch(() => {});
+  // timeout:0 — user may take minutes to log in; default 30s kills the page
+  page.goto(getLoginURL(type, tenantId), { timeout: 0 }).catch(() => {});
   return redirectPromise;
 }
 
