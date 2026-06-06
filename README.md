@@ -148,6 +148,9 @@ We explored "all-in-terminal" auth alternatives and recorded the outcomes:
   - `c@name` forces global contacts lookup
   - while typing mention token, use `Up/Down` in compose to cycle suggestions and prefill
   - posted mentions keep `@` prefix
+- **Own presence status** above Conversations — colored dot shows your current status; `e` to change (Available / Busy / DND / Be Right Back / Away / Appear Offline)
+- **Fuzzy chat search** — `/` in tree pane to filter all chats and channels; `Enter` opens selected
+- **Fuzzy message search** — `/` in chat pane to search messages in current conversation by content or author; `Enter` jumps to message
 - Custom keybindings via config file: `~/.config/fossteams/teams-cli-keybindings.json`
 - Keybinding presets: `default`, `vim`, `emacs`, `jk`
 - Encrypted persistence of:
@@ -174,10 +177,13 @@ We explored "all-in-terminal" auth alternatives and recorded the outcomes:
 | `m` | tree | toggle 1-minute unread scan |
 | `Shift+M` | tree | run unread scan immediately |
 | `G` | tree | jump to most recent chat |
+| `/` | tree | fuzzy search chats/channels |
+| `e` | status node | open status picker |
 | `Ctrl+R` | tree | reload keybindings config |
 | `r` | chat | reply to selected message |
 | `e` | chat | open reaction picker (👍 ❤️ 😆 😮 😢 😠) |
 | `o` | chat | open link or image picker |
+| `/` | chat | fuzzy search messages in conversation |
 | `G` | chat | scroll to bottom (most recent message) |
 | `+` / `-` | image view | grow / shrink terminal image |
 | `Esc` | image view | close image |

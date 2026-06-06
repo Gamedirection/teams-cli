@@ -10,7 +10,7 @@
 ## Medium Priority
 - [ ] **Scheduled Messages**: compose a message and set a future send time. Needs investigation into whether the Teams API exposes a schedule endpoint or if we implement a local scheduler (cron/at) that sends via the existing message API.
 - [ ] **Calendar integration**: view upcoming meetings/events from the Teams calendar. Investigate `GET /api/mt/.../users/me/calendarEvents` or Graph API. Display in a new tree section or modal (keybind `c`?).
-- [ ] **Search**: fuzzy search across chats and messages
+- [x] **Search**: ✅ DONE — `/` in tree for chat fuzzy filter, `/` in chat for message fuzzy search
 - [ ] **Notification sound**: play a sound on new message
 - [ ] **Message pagination**: load older messages on scroll-up
 - [ ] **`--msg N` flag**: limit messages loaded per conversation (from upstream)

@@ -19,12 +19,17 @@
 - **`chafa` auto-install**: install script detects pacman/apt/dnf/zypper and installs chafa if missing.
 - **Image resize**: `+` / `-` in terminal image view to grow/shrink; re-renders chafa at new size. Esc to close.
 - **Inline image thumbnails**: once an image has been viewed (cached in `~/Pictures/teams-cli-screenshots`), it renders as a small 32×8 chafa thumbnail inline in the chat. Press `o` on the thumbnail row to open the full-size popout.
+- **Own status dot**: your name + colored presence dot appears above Conversations in the tree. Press `e` on it to open a status picker (Available / Busy / DND / Be Right Back / Away / Appear Offline). Updates live in the tree node.
+- **Fuzzy chat search** (`/` in tree): type to filter all chats and channels. `Enter` opens, `Down`/`Tab` moves to list, `Esc` closes.
+- **Fuzzy message search** (`/` in chat): search messages in the current conversation by content or author. `Enter` jumps to the message. `Esc` closes.
+- **Compose clear**: `Esc` in compose now clears the text before returning focus to tree.
 
 ### Changed
 - `textMessage()` rewritten as HTML-to-tview converter (preserves formatting, emoji, images).
 - `wrapTextLines()` uses rune-based visible-length measurement so tview markup tags don't break wrapping.
 - Message rendering uses `QueueUpdateDraw` for reliable scroll-to-bottom on load.
 - Image CDN auth: uses `curl` subprocess with `skypetoken_asm` cookie only — `Authorization: Bearer` header was conflicting and causing 401. Root cause took 8 attempts to isolate (see `docs/TODO.md`).
+- Chafa detached from controlling terminal (`Setsid: true`) — prevented terminal query responses from leaking into the compose field as garbage characters.
 - Images cached to disk by URL hash — same image won't re-download.
 
 ### Planned (tracked in docs/TODO.md)
