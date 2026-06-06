@@ -2,6 +2,32 @@
 
 All notable updates made during this project iteration are documented here.
 
+## [v1.2.0-carbonyl] - 2026-06-06 (branch: feat/carbonyl-auth — not yet merged)
+
+### Added
+- **Terminal-native auth via Carbonyl**: Microsoft login page now renders entirely in
+  the terminal using [Carbonyl](https://github.com/fathyb/carbonyl). No desktop window or
+  Electron install required.
+  - `node-pty` gives Carbonyl a real PTY — keyboard input, DUO MFA, and resize all work.
+  - Puppeteer connects to Carbonyl via CDP (`--remote-debugging-port=9977`) to intercept
+    the OAuth redirect `Location` header before the Teams web app loads.
+  - Sequential token acquisition: Teams → Skype → ChatSvcAgg, all in one session.
+  - `timeout: 0` + `setDefaultTimeout(0)` prevent Puppeteer's 30s kick during long auth flows.
+- `jsonwebtoken` upgraded to v9 (fixes `SlowBuffer` crash on Node.js v26+).
+- `teams-token-cli` converted from uninitialized git submodule to tracked source in main repo.
+
+### Changed
+- `teams-token-cli/package.json`: removed `electron`, added `carbonyl`, `puppeteer-core`, `node-pty`.
+- `app.go` auth refresh: looks for `teams-token-cli` directory before falling back to `teams-token`.
+- Launcher (`teams-cli`): `cd "$SCRIPT_DIR"` before exec of pre-built binary so relative paths resolve.
+
+### Known Limitation
+- The "Run teams-token" button / automatic 401 refresh cannot launch Carbonyl headlessly.
+  Manual re-auth required: `cd /opt/teams-cli/teams-token-cli && node ./dist/main.js`
+- See `docs/carbonyl-notes.md` for full session notes and suggestions.
+
+---
+
 ## [v1.1.0] - 2026-06-05
 
 ### Added

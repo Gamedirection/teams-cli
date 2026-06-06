@@ -52,17 +52,21 @@ The installer:
 - installs desktop icon and `.desktop` launcher
 - sets up `teams-token-cli` automatically (yarn, TypeScript, system Electron)
 
-After install, authenticate once:
+After install, authenticate once (terminal-native — no desktop required):
 
 ```bash
-cd /opt/teams-cli/teams-token-cli && yarn start
+cd /opt/teams-cli/teams-token-cli && node ./dist/main.js
 ```
+
+Microsoft login renders in your terminal. Log in, complete MFA, tokens auto-save.
 
 Then run:
 
 ```bash
 teams-cli
 ```
+
+When tokens expire (Teams tokens last ~1 hour), re-run the auth command above.
 
 ## Development Run
 
@@ -72,7 +76,7 @@ go run ./
 
 ## teams-token Integration
 
-This repo includes `teams-token-cli` as a git submodule for token refresh on `401 Unauthorized`.
+`teams-token-cli` handles Microsoft OAuth authentication using [Carbonyl](https://github.com/fathyb/carbonyl) — a Chromium browser that renders in the terminal.
 
 ```bash
 git submodule update --init --recursive
