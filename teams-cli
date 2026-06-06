@@ -8,6 +8,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 if [[ -x "$SCRIPT_DIR/teams-cli-bin" ]]; then
+  cd "$SCRIPT_DIR"
   exec "$SCRIPT_DIR/teams-cli-bin" "$@"
 fi
 
