@@ -3298,12 +3298,7 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 	home := os.Getenv("HOME")
 	configDir := filepath.Join(home, ".config", "fossteams")
 
-	// Determine cache path from URL hash
-	urlHash := fmt.Sprintf("%x", func() uint32 {
-		h := uint32(2166136261)
-		for _, b := range []byte(imageURL) { h ^= uint32(b); h *= 16777619 }
-		return h
-	}())
+	urlHash := urlHashStr(imageURL)
 	cacheDir := s.effectiveImageDir()
 	if mkErr := os.MkdirAll(cacheDir, 0o700); mkErr != nil {
 		cacheDir = os.TempDir()
@@ -3418,6 +3413,42 @@ func (s *AppState) renderImageChafa(imageURL string) (string, error) {
 
 // tviewTagRe matches tview color/style tags like [red], [::b], [-], [#aabbcc].
 var tviewTagRe = regexp.MustCompile(`\[[^\[]*?\]`)
+var privateAnsiRe = regexp.MustCompile(`\x1b\[[?][0-9;]*[a-zA-Z]`)
+
+func urlHashStr(url string) string {
+	h := uint32(2166136261)
+	for _, b := range []byte(url) {
+		h ^= uint32(b)
+		h *= 16777619
+	}
+	return fmt.Sprintf("%x", h)
+}
+
+func (s *AppState) getInlineThumbnail(imageURL string) string {
+	cacheDir := s.effectiveImageDir()
+	hash := urlHashStr(imageURL)
+	entries, _ := os.ReadDir(cacheDir)
+	var cachedPath string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), hash) {
+			if info, _ := e.Info(); info != nil && info.Size() > 512 {
+				cachedPath = filepath.Join(cacheDir, e.Name())
+				break
+			}
+		}
+	}
+	if cachedPath == "" {
+		return ""
+	}
+	out, err := exec.Command("chafa", "--format", "symbols", "--size", "32x8", cachedPath).Output()
+	if err != nil {
+		return ""
+	}
+	clean := privateAnsiRe.ReplaceAllString(string(out), "")
+	var sb strings.Builder
+	fmt.Fprint(tview.ANSIWriter(&sb), clean)
+	return sb.String()
+}
 
 // visibleLen returns the display length of a string, excluding tview markup tags.
 func visibleLen(s string) int {
@@ -3884,8 +3915,6 @@ func (s *AppState) openImageInTerminal(item linkItem) {
 		composeView.SetTitle(s.composeTitleWithScanStatus() + " | Loading image...")
 	}
 
-	privateSeqRe := regexp.MustCompile(`\x1b\[[?][0-9;]*[a-zA-Z]`)
-
 	// renderAt runs chafa at given size and shows the modal.
 	// Declared as var so the input handler can call it recursively.
 	var renderAt func(cols, rows int)
@@ -3916,7 +3945,7 @@ func (s *AppState) openImageInTerminal(item linkItem) {
 					}
 					return
 				}
-				clean := privateSeqRe.ReplaceAllString(string(out), "")
+				clean := privateAnsiRe.ReplaceAllString(string(out), "")
 				tv := tview.NewTextView().SetDynamicColors(true).SetScrollable(true)
 				fmt.Fprint(tview.ANSIWriter(tv), clean)
 				tv.SetBorder(true).
@@ -4841,6 +4870,21 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 				}
 				chatList.AddItem("  "+rendered, "", 0, nil)
 				rowMap = append(rowMap, msgIdx)
+			}
+
+			// Inline thumbnails for cached images
+			for _, link := range extractLinksFromHTML(message.Content) {
+				if !link.isImage {
+					continue
+				}
+				thumb := s.getInlineThumbnail(link.url)
+				if thumb == "" {
+					continue
+				}
+				for _, tline := range strings.Split(strings.TrimRight(thumb, "\n"), "\n") {
+					chatList.AddItem("  "+tline, "", 0, nil)
+					rowMap = append(rowMap, msgIdx)
+				}
 			}
 
 			// Blank line between messages

@@ -18,6 +18,7 @@
 - **`G` in chat pane**: scroll to the bottom (most recent message).
 - **`chafa` auto-install**: install script detects pacman/apt/dnf/zypper and installs chafa if missing.
 - **Image resize**: `+` / `-` in terminal image view to grow/shrink; re-renders chafa at new size. Esc to close.
+- **Inline image thumbnails**: once an image has been viewed (cached in `~/Pictures/teams-cli-screenshots`), it renders as a small 32×8 chafa thumbnail inline in the chat. Press `o` on the thumbnail row to open the full-size popout.
 
 ### Changed
 - `textMessage()` rewritten as HTML-to-tview converter (preserves formatting, emoji, images).
