@@ -101,6 +101,7 @@ type AppState struct {
 	chatWordWrap      bool
 	chatWrapChars     int
 	chatWrapEffective int
+	chatMarkdown      bool
 
 	themeMu          sync.RWMutex
 	composeColorName string
@@ -162,6 +163,7 @@ type persistedChatSettings struct {
 	ChatWordWrap    *bool               `json:"chat_word_wrap,omitempty"`
 	ChatWrapPercent *int                `json:"chat_wrap_percent,omitempty"`
 	ChatWrapChars   *int                `json:"chat_wrap_chars,omitempty"`
+	ChatMarkdown    *bool               `json:"chat_markdown,omitempty"`
 	ComposeColor    string              `json:"compose_color,omitempty"`
 	AuthorColor     string              `json:"author_color,omitempty"`
 	Groups          map[string][]string `json:"groups,omitempty"`
@@ -196,6 +198,7 @@ const (
 	settingsItemWrapPct      = "chat_wrap_pct"
 	settingsItemComposeColor = "compose_color"
 	settingsItemAuthorColor  = "author_color"
+	settingsItemMarkdown     = "chat_markdown"
 )
 
 const (
@@ -227,6 +230,7 @@ func (s *AppState) createApp() {
 	s.manualUnread = map[string]bool{}
 	s.messageReactions = map[string]string{}
 	s.chatWordWrap = true
+	s.chatMarkdown = true
 	s.chatWrapChars = 80
 	s.composeColorName = "slate"
 	s.authorColorName = "blue"
@@ -1131,6 +1135,8 @@ func (s *AppState) renderSettingsHelpItems(chatList *tview.List) {
 			chatList.AddItem("Compose Color", s.formatComposeColorLine()+" (Enter to cycle)", 0, nil)
 		case settingsItemAuthorColor:
 			chatList.AddItem("Username Color", s.formatAuthorColorLine()+" (Enter to cycle)", 0, nil)
+		case settingsItemMarkdown:
+			chatList.AddItem("Markdown", s.formatMarkdownLine()+" (Enter to toggle)", 0, nil)
 		case settingsItemReload:
 			chatList.AddItem("Reload Keybindings", "Reload from config file (Enter/Ctrl+R)", 0, nil)
 		case settingsItemBinding:
@@ -1151,6 +1157,7 @@ func (s *AppState) buildSettingsItems() []settingsItem {
 		{kind: settingsItemSpacer},
 		{kind: settingsItemWrap},
 		{kind: settingsItemWrapPct},
+		{kind: settingsItemMarkdown},
 		{kind: settingsItemComposeColor},
 		{kind: settingsItemAuthorColor},
 		{kind: settingsItemSpacer},
@@ -1246,6 +1253,14 @@ func (s *AppState) handleSettingsSelection(index int) {
 		s.persistEncryptedChatSettings()
 		s.rerenderActiveChatMessages()
 		composeView.SetTitle(s.composeTitleWithScanStatus() + " | Usernames: " + s.formatAuthorColorLine())
+		s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
+	case settingsItemMarkdown:
+		s.chatWordWrapMu.Lock()
+		s.chatMarkdown = !s.chatMarkdown
+		s.chatWordWrapMu.Unlock()
+		s.persistEncryptedChatSettings()
+		s.rerenderActiveChatMessages()
+		composeView.SetTitle(s.composeTitleWithScanStatus() + " | Markdown: " + s.formatMarkdownLine())
 		s.renderSettingsHelpItems(s.components[ViChat].(*tview.List))
 	case settingsItemBinding:
 		s.settingsMu.Lock()
@@ -1395,6 +1410,31 @@ func (s *AppState) applyComposeTheme() {
 	input.SetFieldTextColor(tcell.ColorWhite)
 	input.SetLabelColor(tcell.ColorWhite)
 	input.SetPlaceholderTextColor(tcell.ColorLightGray)
+}
+
+func (s *AppState) formatMarkdownLine() string {
+	s.chatWordWrapMu.RLock()
+	md := s.chatMarkdown
+	s.chatWordWrapMu.RUnlock()
+	if md {
+		return "ON"
+	}
+	return "OFF"
+}
+
+var (
+	mdBold   = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	mdItalic = regexp.MustCompile(`\*(.+?)\*`)
+	mdCode   = regexp.MustCompile("`(.+?)`")
+	mdStrike = regexp.MustCompile(`~~(.+?)~~`)
+)
+
+func applyMarkdown(text string) string {
+	text = mdBold.ReplaceAllString(text, "[::b]$1[::-]")
+	text = mdItalic.ReplaceAllString(text, "[::i]$1[::-]")
+	text = mdCode.ReplaceAllString(text, "[green]$1[-]")
+	text = mdStrike.ReplaceAllString(text, "[::s]$1[::-]")
+	return text
 }
 
 func (s *AppState) isChatWordWrap() bool {
@@ -3073,16 +3113,22 @@ func openInBrowser(url string) {
 	exec.Command("xdg-open", url).Start() //nolint
 }
 
-func (s *AppState) renderImageChafa(imageURL string) (string, error) {
+// downloadImage fetches a Teams CDN image with auth token, returns path to temp file.
+// Caller is responsible for deleting the file.
+func (s *AppState) downloadImage(imageURL string) (string, error) {
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", imageURL, nil)
 	if err != nil {
 		return "", err
 	}
-	// Try to attach Teams bearer token for authenticated CDN images
-	tokenPath := filepath.Join(os.Getenv("HOME"), ".config", "fossteams", "token-teams.jwt")
-	if data, readErr := os.ReadFile(tokenPath); readErr == nil {
-		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(data)))
+	home := os.Getenv("HOME")
+	configDir := filepath.Join(home, ".config", "fossteams")
+	// Try skype token first (used for media), fall back to teams token
+	for _, name := range []string{"token-skype.jwt", "token-teams.jwt", "token-chatsvcagg.jwt"} {
+		if data, e := os.ReadFile(filepath.Join(configDir, name)); e == nil {
+			req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(data)))
+			break
+		}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -3090,23 +3136,46 @@ func (s *AppState) renderImageChafa(imageURL string) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("image fetch returned %d", resp.StatusCode)
+		return "", fmt.Errorf("image fetch returned %d (auth required?)", resp.StatusCode)
 	}
 
-	tmp, err := os.CreateTemp("", "teams-img-*.bin")
+	// Detect extension from Content-Type
+	ext := ".bin"
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		switch {
+		case strings.Contains(ct, "jpeg"):
+			ext = ".jpg"
+		case strings.Contains(ct, "png"):
+			ext = ".png"
+		case strings.Contains(ct, "gif"):
+			ext = ".gif"
+		case strings.Contains(ct, "webp"):
+			ext = ".webp"
+		}
+	}
+
+	tmp, err := os.CreateTemp("", "teams-img-*"+ext)
 	if err != nil {
 		return "", err
 	}
-	defer os.Remove(tmp.Name())
 	if _, err = io.Copy(tmp, resp.Body); err != nil {
 		tmp.Close()
+		os.Remove(tmp.Name())
 		return "", err
 	}
 	tmp.Close()
+	return tmp.Name(), nil
+}
 
-	out, err := exec.Command("chafa", "--format", "symbols", "--size", "60x20", tmp.Name()).Output()
+func (s *AppState) renderImageChafa(imageURL string) (string, error) {
+	path, err := s.downloadImage(imageURL)
 	if err != nil {
-		return "", fmt.Errorf("chafa error: %v", err)
+		return "", err
+	}
+	defer os.Remove(path)
+	out, err := exec.Command("chafa", "--format", "symbols", "--size", "60x20", path).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("chafa: %v — %s", err, strings.TrimSpace(string(out)))
 	}
 	return string(out), nil
 }
@@ -3119,7 +3188,6 @@ func textMessage(input string) string {
 		if tt == html.ErrorToken {
 			break
 		}
-
 		switch tt {
 		case html.TextToken:
 			text := string(z.Text())
@@ -3127,9 +3195,29 @@ func textMessage(input string) string {
 				continue
 			}
 			output += fmt.Sprintf("%v\n", text)
-		}
-		if tt == html.ErrorToken {
-			break
+		case html.StartTagToken, html.SelfClosingTagToken:
+			tagBytes, hasAttr := z.TagName()
+			tagName := string(tagBytes)
+			attrs := map[string]string{}
+			for hasAttr {
+				k, v, more := z.TagAttr()
+				attrs[string(k)] = string(v)
+				if !more {
+					break
+				}
+			}
+			// Teams encodes emoji as <emoji alt="😊"> or <img class="emoji" alt="😊">
+			if tagName == "emoji" {
+				if alt := strings.TrimSpace(attrs["alt"]); alt != "" {
+					output += alt
+				}
+			} else if tagName == "img" {
+				if strings.Contains(strings.ToLower(attrs["class"]), "emoji") {
+					if alt := strings.TrimSpace(attrs["alt"]); alt != "" {
+						output += alt
+					}
+				}
+			}
 		}
 	}
 	return output
@@ -3428,7 +3516,27 @@ func (s *AppState) showImageOptionsModal(item linkItem) {
 	list.SetBorder(true).SetTitle(" "+item.text+" ").SetTitleAlign(tview.AlignCenter)
 	list.AddItem("Open in browser", "", 0, func() {
 		s.pages.RemovePage(PageLinkPicker)
-		openInBrowser(item.url)
+		composeView, _ := s.components[ViCompose].(*tview.InputField)
+		if composeView != nil {
+			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Downloading image...")
+			s.app.Draw()
+		}
+		go func() {
+			// Download with auth token; open temp file in browser
+			path, err := s.downloadImage(item.url)
+			s.app.QueueUpdateDraw(func() {
+				if composeView != nil {
+					composeView.SetTitle(s.composeTitleWithScanStatus())
+				}
+			})
+			if err != nil {
+				// Fallback: open URL directly (works for public images)
+				openInBrowser(item.url)
+				return
+			}
+			// Don't delete — browser needs the file; OS will clean temp on reboot
+			openInBrowser(path)
+		}()
 	})
 	list.AddItem("View in terminal", "", 0, func() {
 		s.pages.RemovePage(PageLinkPicker)
@@ -3459,6 +3567,7 @@ func (s *AppState) openImageInTerminal(item linkItem) {
 		s.app.Draw()
 	}
 	go func() {
+		defer func() { recover() }() //nolint
 		rendered, err := s.renderImageChafa(item.url)
 		s.app.QueueUpdateDraw(func() {
 			if composeView != nil {
@@ -4358,17 +4467,28 @@ func (s *AppState) loadConversationsByIDs(selectedNode *tview.TreeNode, conversa
 			rowMap = append(rowMap, msgIdx)
 
 			// Content lines (indented)
+			s.chatWordWrapMu.RLock()
+			markdownOn := s.chatMarkdown
+			s.chatWordWrapMu.RUnlock()
 			if s.isChatWordWrap() {
 				lines := wrapTextLines(textMessage(message.Content), wrapWidth-2)
 				if len(lines) == 0 {
 					lines = []string{""}
 				}
 				for _, line := range lines {
-					chatList.AddItem("  "+line, "", 0, nil)
+					rendered := line
+					if markdownOn {
+						rendered = applyMarkdown(rendered)
+					}
+					chatList.AddItem("  "+rendered, "", 0, nil)
 					rowMap = append(rowMap, msgIdx)
 				}
 			} else {
-				chatList.AddItem("  "+s.formatChatMessageText(message.Content), "", 0, nil)
+				rendered := s.formatChatMessageText(message.Content)
+				if markdownOn {
+					rendered = applyMarkdown(rendered)
+				}
+				chatList.AddItem("  "+rendered, "", 0, nil)
 				rowMap = append(rowMap, msgIdx)
 			}
 
@@ -4767,6 +4887,11 @@ func (s *AppState) loadEncryptedChatSettings() error {
 	} else {
 		s.chatWrapChars = 80
 	}
+	if settings.ChatMarkdown == nil {
+		s.chatMarkdown = true
+	} else {
+		s.chatMarkdown = *settings.ChatMarkdown
+	}
 	s.chatWordWrapMu.Unlock()
 	s.themeMu.Lock()
 	s.composeColorName = normalizeComposeColorName(settings.ComposeColor)
@@ -4820,6 +4945,10 @@ func (s *AppState) persistEncryptedChatSettings() {
 	settings.ChatWordWrap = &wrap
 	wrapChars := s.getChatWrapPercent()
 	settings.ChatWrapChars = &wrapChars
+	s.chatWordWrapMu.RLock()
+	md := s.chatMarkdown
+	s.chatWordWrapMu.RUnlock()
+	settings.ChatMarkdown = &md
 	s.themeMu.RLock()
 	settings.ComposeColor = normalizeComposeColorName(s.composeColorName)
 	settings.AuthorColor = normalizeAuthorColorName(s.authorColorName)
