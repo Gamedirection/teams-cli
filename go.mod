@@ -1,4 +1,4 @@
-module github.com/fossteams/teams-cli
+module github.com/Gamedirection/teams-cli
 
 go 1.18
 

@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]
+
+jobs:
+  appimage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Read version
+        id: version
+        run: echo "VERSION=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        run: |
+          go build -ldflags "-X main.version=${{ steps.version.outputs.VERSION }}" -o teams-cli .
+
+      - name: Install AppImage tools
+        run: |
+          sudo apt-get install -y libfuse2 wget
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+
+      - name: Build AppImage
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
+
+          cp teams-cli AppDir/usr/bin/teams-cli
+          cp img/DarkMode_Color.svg AppDir/usr/share/icons/hicolor/scalable/apps/teams-cli.svg
+
+          cat > AppDir/usr/share/applications/teams-cli.desktop << 'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=teams-cli
+          Comment=Terminal UI for Microsoft Teams
+          Exec=teams-cli
+          Icon=teams-cli
+          Terminal=true
+          Categories=Network;Chat;
+          EOF
+
+          ARCH=x86_64 ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --output appimage
+
+          # Rename to include version
+          mv teams-cli-x86_64.AppImage teams-cli-${VERSION}-x86_64.AppImage
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: teams-cli-appimage-${{ steps.version.outputs.VERSION }}
+          path: "*.AppImage"
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "teams-cli v${{ steps.version.outputs.VERSION }}"
+          files: "*.AppImage"
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ### AppImage (universal Linux)
+            ```bash
+            chmod +x teams-cli-${{ steps.version.outputs.VERSION }}-x86_64.AppImage
+            ./teams-cli-${{ steps.version.outputs.VERSION }}-x86_64.AppImage
+            ```
+
+            ### One-line installer
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/Gamedirection/teams-cli/master/scripts/install.sh | sudo bash
+            ```
+
+            ### First-time auth (after install)
+            ```bash
+            cd /opt/teams-cli/teams-token-cli && yarn start
+            ```
