@@ -832,6 +832,19 @@ func (s *AppState) fillMainWindow() {
 			}
 			return event
 		}
+		if event.Key() == tcell.KeyRune && event.Rune() == 'G' {
+			// Jump to most recent chat (first child of recentNode)
+			children := recentNode.GetChildren()
+			if len(children) == 0 {
+				// Fall back to first child of favoritesNode
+				children = favoritesNode.GetChildren()
+			}
+			if len(children) > 0 {
+				treeView.SetCurrentNode(children[0])
+				treeView.GetCurrentNode() // trigger focus update
+			}
+			return nil
+		}
 		if s.bindingMatches(actionRefreshTitles, event) {
 			go s.refreshAllChatLabels(chatsNode)
 			return nil
@@ -1602,6 +1615,7 @@ func (s *AppState) createHelpModal() tview.Primitive {
 				"  Tab / Shift+Tab   next / prev pane\n" +
 				"  ?                 toggle this help\n\n" +
 				"[green]Tree pane[-]\n" +
+				"  G                   jump to most recent chat\n" +
 				"  " + key(actionToggleFavorite) + "                   toggle favorite\n" +
 				"  g                   move to group / manage group\n" +
 				"  " + key(actionRefreshTitles) + "                   refresh chat titles\n" +
@@ -3258,6 +3272,8 @@ func textMessage(input string) string {
 				}
 			}
 			switch tagName {
+			case "a":
+				out.WriteString("[::u]")
 			case "b", "strong":
 				out.WriteString("[::b]")
 			case "i", "em":
@@ -3300,7 +3316,7 @@ func textMessage(input string) string {
 			tagBytes, _ := z.TagName()
 			tagName := strings.ToLower(string(tagBytes))
 			switch tagName {
-			case "b", "strong", "i", "em", "u", "s", "strike", "del":
+			case "a", "b", "strong", "i", "em", "u", "s", "strike", "del":
 				out.WriteString("[::-]")
 			case "code", "pre":
 				out.WriteString("[-]")
