@@ -1,4 +1,5 @@
 import puppeteer, { Browser, Page, Frame } from 'puppeteer-core';
+import { spawn } from 'child_process';
 import { homedir } from 'os';
 import { writeFileSync, existsSync, mkdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
@@ -15,6 +16,7 @@ const TEAMS_APP_ID = '5e3ce6c0-2b1f-4285-8d4b-75ee78787346';
 const SKYPE_RESOURCE = 'https://api.spaces.skype.com';
 const CHAT_SVC_AGG_RESOURCE = 'https://chatsvcagg.teams.microsoft.com';
 const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) MicrosoftTeams-Preview/1.4.00.7556 Chrome/80.0.3987.163 Electron/8.5.5 Safari/537.36';
+const DEBUG_PORT = 9977;
 
 type TeamsSkype = 'teams' | 'skype' | 'chatsvcagg';
 
@@ -111,21 +113,47 @@ async function authorize(page: Page, type: TeamsSkype, tenantId: string): Promis
   return redirectPromise;
 }
 
+async function waitForCDP(port: number): Promise<void> {
+  for (let i = 0; i < 75; i++) {
+    try {
+      const res = await fetch(`http://localhost:${port}/json`);
+      if (res.ok) return;
+    } catch { /* not ready yet */ }
+    await new Promise(r => setTimeout(r, 200));
+  }
+  throw new Error(`Carbonyl CDP not available on port ${port} after 15s`);
+}
+
 async function main() {
-  const browser: Browser = await puppeteer.launch({
-    executablePath: carbonylBin,
-    headless: false,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu-sandbox'],
+  // Spawn Carbonyl — renders in this terminal, exposes CDP on debug port
+  const proc = spawn(carbonylBin, [
+    `--remote-debugging-port=${DEBUG_PORT}`,
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+  ], { stdio: 'inherit' });
+
+  proc.on('error', (err) => { console.error('Failed to start Carbonyl:', err.message); process.exit(1); });
+
+  const cleanup = () => { try { proc.kill(); } catch { /* ignore */ } };
+  process.on('exit', cleanup);
+  process.on('SIGINT', () => { cleanup(); process.exit(0); });
+  process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+
+  await waitForCDP(DEBUG_PORT);
+
+  const browser: Browser = await puppeteer.connect({
+    browserURL: `http://localhost:${DEBUG_PORT}`,
   });
 
   try {
-    const page = await browser.newPage();
+    const pages = await browser.pages();
+    const page = pages[0] || await browser.newPage();
     await page.setUserAgent(USER_AGENT);
 
     let currentTenant: string | null = null;
     let redirectCount = 0;
 
-    const processHash = async (hash: string, type: TeamsSkype): Promise<void> => {
+    const processHash = async (hash: string): Promise<void> => {
       redirectCount++;
       if (redirectCount > 8) throw new Error('Too many redirects');
 
@@ -136,22 +164,19 @@ async function main() {
         if (searchParams.has('error')) {
           throw new Error(`${searchParams.get('error')}: ${searchParams.get('error_description')}`);
         }
-        throw new Error('No token in redirect URL');
+        throw new Error('No token found in redirect URL');
       }
 
       const decoded = jwt.decode(token) as Record<string, unknown>;
       if (!decoded || typeof decoded === 'string') throw new Error('Invalid JWT');
 
       console.log(`Audience: ${decoded.aud}`);
-      console.log('Decoded', decoded);
 
-      // Microsoft-tenant Skype response → need to resolve real tenant first
       if (decoded.tid === MICROSOFT_TENANT_ID && decoded.aud === SKYPE_RESOURCE) {
-        console.log('Getting tenant list...');
+        console.log('Resolving real tenant...');
         const tenants = (await getTenants(token)).data;
         currentTenant = tenants[0].tenantId;
-        const skypeHash = await authorize(page, 'skype', currentTenant);
-        return processHash(skypeHash, 'skype');
+        return processHash(await authorize(page, 'skype', currentTenant));
       }
 
       if (!currentTenant) {
@@ -161,13 +186,11 @@ async function main() {
       if (decoded.aud === TEAMS_APP_ID) {
         console.log('Got Teams token');
         saveToken(token, 'teams');
-        const skypeHash = await authorize(page, 'skype', currentTenant);
-        return processHash(skypeHash, 'skype');
+        return processHash(await authorize(page, 'skype', currentTenant));
       } else if (decoded.aud === SKYPE_RESOURCE) {
         console.log('Got Skype token');
         saveToken(token, 'skype');
-        const aggHash = await authorize(page, 'chatsvcagg', currentTenant);
-        return processHash(aggHash, 'chatsvcagg');
+        return processHash(await authorize(page, 'chatsvcagg', currentTenant));
       } else if (decoded.aud === CHAT_SVC_AGG_RESOURCE) {
         console.log('Got ChatSvcAgg token');
         saveToken(token, 'chatsvcagg');
@@ -176,12 +199,11 @@ async function main() {
       }
     };
 
-    const teamsHash = await authorize(page, 'teams', 'common');
-    await processHash(teamsHash, 'teams');
-
+    await processHash(await authorize(page, 'teams', 'common'));
     console.log('\nAll tokens saved to', CONFIG_DIR);
   } finally {
-    await browser.close();
+    browser.disconnect();
+    cleanup();
   }
 }
 
