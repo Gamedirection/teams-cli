@@ -1,6 +1,38 @@
 # Changelog
 
-All notable updates made during this project iteration are documented here.
+## [v1.2.0] - 2026-06-06
+
+### Added
+- **Emoji reactions**: `e` key opens a picker (👍 ❤️ 😆 😮 😢 😠). Unknown reaction types fall back to 👍.
+- **Emoji display in chat**: `<emoji alt="😊">` and `<img class="emoji" alt="😊">` HTML tags now render as actual emoji characters.
+- **Clickable links**: `o` key on any message opens a link/image picker. Links open in browser via `xdg-open`. Images offer browser or terminal view.
+- **Terminal image viewer**: images rendered with `chafa` in a scrollable popup (Esc to close). Install auto-detected via package manager.
+- **Image sending**: type `<img>~/path/to/file.png</img>` in compose to embed a base64 image. Supports PNG, JPG, GIF, WebP, SVG.
+- **Image placeholder**: non-emoji `<img>` tags display `🖼️ filename` in chat.
+- **Image save folder**: configurable in Settings & Help → `Image Save Folder`. Default: `~/.local/share/teams-cli/images/`. Symlink at `~/Pictures/teams-cli-screenshots`.
+- **HTML formatting in received messages**: `<b>`, `<i>`, `<u>`, `<s>`, `<code>`, `<blockquote>`, `<br>` all render with tview markup (bold, italic, underline, strikethrough, green code, gray quote prefix).
+- **Links underlined**: `<a href>` renders with tview underline markup.
+- **Markdown toggle**: Settings & Help → `Markdown` (ON by default). Toggles markdown rendering in received messages.
+- **Markdown on send**: compose markdown converts to HTML before sending — `**bold**`, `*italic*`, `__underline__`, `~~strike~~`, `` `code` ``, ` ```block``` `, `> quote`.
+- **`G` in tree pane**: jump to and open the most recently active chat.
+- **`G` in chat pane**: scroll to the bottom (most recent message).
+- **`chafa` auto-install**: install script detects pacman/apt/dnf/zypper and installs chafa if missing.
+
+### Changed
+- `textMessage()` rewritten as HTML-to-tview converter (preserves formatting, emoji, images).
+- `wrapTextLines()` uses rune-based visible-length measurement so tview markup tags don't break wrapping.
+- Message rendering uses `QueueUpdateDraw` for reliable scroll-to-bottom on load.
+- Image CDN auth: `fetchShortSkypeToken()` does the `/api/authsvc/v1.0/authz` exchange and sends result as `Cookie: skypetoken_asm` (confirmed working via curl testing).
+- Images cached to disk by URL hash — same image won't re-download.
+
+### Fixed
+- `wrapTextLines` panic: `strings.LastIndex` returns byte index, used as rune index → slice-out-of-bounds. Fixed with rune-based space search.
+- `s.app.Draw()` inside tview callbacks caused deadlock/crash. Removed.
+- Private ANSI sequences (`[?25l`, `[?25h`) from chafa output caused `tview.ANSIWriter` panic. Stripped before rendering.
+- Launcher missing `cd "$SCRIPT_DIR"` before binary exec — relative paths (teams-token-cli) resolved from wrong directory.
+- `app.go` auth refresh looked for `teams-token` dir; renamed to `teams-token-cli`.
+
+---
 
 ## [v1.1.0] - 2026-06-05
 
@@ -15,96 +47,23 @@ All notable updates made during this project iteration are documented here.
 - **"No messages yet." placeholder** when a conversation has no messages.
 
 ### Changed
-- **Chat message layout redesign**:
-  - Author name displayed above message content (header-first, matching standard chat app conventions).
-  - Content lines indented 2 spaces under the author header.
-  - Blank line between each message for visual separation.
-  - Secondary text disabled; author, timestamp, and reactions embedded in the primary line.
-- **Scroll-to-bottom on load**: uses `QueueUpdateDraw` to reliably position at the latest message after initial load.
-- **Installer improvements** (`scripts/install.sh`):
-  - `chown` install dir to the invoking user so `go run` can write `.cache` without `sudo`.
-  - Launcher GOCACHE moved from `/opt/teams-cli/.cache` to `$HOME/.cache/teams-cli/go-build`.
-  - `teams-token-cli` set up automatically: yarn install, TypeScript upgrade, system electron detection and symlink (`electron41/39/37`), `path.txt` written without trailing newline.
-  - Post-install message prints first-time auth instructions.
-  - `node` added to dependency check list.
+- Chat message layout redesign: author above content, indented lines, blank line between messages.
+- Scroll-to-bottom on load uses `QueueUpdateDraw`.
+- Installer: `chown` to invoking user, GOCACHE to `$HOME/.cache`, teams-token-cli auto-setup, binary build during install.
 
 ### Fixed
-- Running `teams-cli` as a regular user failed with permission denied on `.cache` write under `/opt`.
-- `teams-token-cli` build failures on modern Node (TypeScript 4.2 vs undici-types parse errors, missing `rootDir`, deprecated `baseUrl`).
-- Electron binary not found after `yarn install` when no pre-built binary is downloaded (resolved via system electron symlink).
+- Running `teams-cli` as regular user failed (permission denied on `.cache` under `/opt`).
+- teams-token-cli TypeScript build failures on Node v26 (undici-types, rootDir, deprecated baseUrl, SlowBuffer).
+- Electron binary missing — resolved via system electron symlink.
 
 ---
 
 ## [v1.0.0] - 2026-02-19
 
 ### Added
-- Favorites section at the top of Chats, grouped with existing team/chat structure.
-- Favorite toggle via hotkey (`f`) in chat tree and chat contexts.
-- Private Notes/self chat discovery and favorite toggling support.
-- DM support improvements:
-  - included DMs in the chat list,
-  - sorted by most recent activity,
-  - improved author/title resolution,
-  - reply/send-back support.
-- One-minute unread scanner with on/off toggle and manual scan trigger.
-- Manual unread marking for chats.
-- Persistent unread markers integrated with scanner updates.
-- Built-in `Settings & Help` chat node at the bottom of chat tree.
-- Reply mode for selected messages in chat view (`r` in chat pane).
-- Reactions display in message UI and quick reaction hotkey (`e`).
-- Mention/tagging support:
-  - `@name` for current thread members,
-  - `c@name` to force global contacts,
-  - `Up/Down` cycling for mention suggestions in compose.
-- Configurable keybindings:
-  - in-app binding editor,
-  - preset cycling (`default`, `vim`, `emacs`, `jk`),
-  - runtime reload without app restart.
-- Chat text mode controls:
-  - `Word Wrap` and `Scroll` modes,
-  - wrap width by characters,
-  - preset widths: `20, 40, 72, 80, 100, 200, 400, 600, 800, 1000`, plus custom.
-- Encrypted settings persistence for:
-  - favorite chats,
-  - custom chat titles,
-  - wrap settings,
-  - unread overrides,
-  - compose/author color settings.
-- Theme customization in settings:
-  - compose input highlight color cycling,
-  - username color cycling.
-- teams-token integration:
-  - added as optional submodule at `/teams-token`,
-  - automatic 401 auth-refresh attempts,
-  - manual `Run teams-token` button on 401 error screen.
-- Installation/packaging improvements:
-  - installer script targets system paths,
-  - CLI command `teams-cli` available after install,
-  - desktop launcher/icon install support.
-
-### Changed
-- Compose highlight color moved to a darker palette; default now `slate`.
-- Wrap mode styling aligned with scroll mode for consistent message/author presentation.
-- Settings UI spacing improved so options are easier to scan.
-- README expanded with install methods, hotkeys, settings, keybinds, and roadmap details.
-
-### Fixed
-- Crash when toggling favorites with `f`.
-- Crash paths around unread toggle/scan hotkeys (`m`, `Shift+M`, `r`) across panes.
-- Settings/help interaction crashes.
-- 401 refresh flow messaging and fallback behavior when teams-token runners are missing.
-- Mentions not cycling/selecting correctly in compose.
-- Mention lookup fallback issues across DMs/group chats/private notes.
-- Word wrap width handling bugs and effective width calculation issues.
-- Compose/readability color contrast issues.
-
-### Docs and Repo Hygiene
-- README updated repeatedly to reflect new features and controls.
-- `.gitignore` updated to include encrypted/key artifacts (`*.enc`, `*.key`).
-- `.cache` cleanup guidance applied to reduce accidental tracking.
+- Favorites, unread scanner, DM support, reply mode, reactions, mentions, keybinding editor, wrap settings, encrypted settings, theme colors, teams-token integration.
 
 ---
 
-## Prior Baseline (before this iteration)
-- Existing Teams/channel listing and basic chat rendering from earlier project history.
-- teams-api and UI foundation already in place.
+## Prior Baseline
+- Teams/channel listing and basic chat rendering from earlier project history.

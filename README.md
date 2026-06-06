@@ -6,7 +6,7 @@
 
 A terminal UI for Microsoft Teams powered by [teams-api](https://github.com/fossteams/teams-api).
 
-Current stable version: `v1.1.0`
+Current stable version: `v1.2.0`
 
 <img width="1091" height="641" alt="image" src="https://github.com/user-attachments/assets/8a15d464-74d7-4728-9f74-2b8452c45689" />
 
@@ -134,7 +134,14 @@ We explored "all-in-terminal" auth alternatives and recorded the outcomes:
   - send time shown in dark grey next to author
   - blank line between messages
   - "No messages yet." placeholder for empty conversations
-- Message reactions display and quick react hotkey (`e` adds 👍)
+- Message reactions display with emoji rendering (👍 ❤️ 😆 😮 😢 😠)
+- Reaction picker (`e`) — choose any reaction
+- Links and images in messages (`o` to open/view)
+  - Images saved to `~/Pictures/teams-cli-screenshots` (configurable in Settings)
+  - Terminal image rendering via `chafa` (requires fresh tokens)
+- HTML formatting displayed: **bold**, *italic*, underline, ~~strike~~, `code`, blockquotes
+- Markdown on send: type `**bold**`, `*italic*`, `` `code` ``, `> quote`, `~~strike~~`
+- Send images: type `<img>~/path/to/file.png</img>` in compose
 - Reply mode in chat (`r` replies to selected message)
 - Mentions in compose:
   - `@name` prefers current chat members, then global contacts
@@ -166,9 +173,12 @@ We explored "all-in-terminal" auth alternatives and recorded the outcomes:
 | `r` | tree | mark selected chat unread |
 | `m` | tree | toggle 1-minute unread scan |
 | `Shift+M` | tree | run unread scan immediately |
+| `G` | tree | jump to most recent chat |
 | `Ctrl+R` | tree | reload keybindings config |
 | `r` | chat | reply to selected message |
-| `e` | chat | react 👍 to selected message |
+| `e` | chat | open reaction picker (👍 ❤️ 😆 😮 😢 😠) |
+| `o` | chat | open link or image picker |
+| `G` | chat | scroll to bottom (most recent message) |
 | `Enter` | compose | send message |
 | `Esc` | compose | back to tree |
 

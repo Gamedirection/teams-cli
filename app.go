@@ -1004,6 +1004,13 @@ func (s *AppState) fillMainWindow() {
 			}
 			return event
 		}
+		if event.Key() == tcell.KeyRune && event.Rune() == 'G' {
+			n := chatView.GetItemCount()
+			if n > 0 {
+				chatView.SetCurrentItem(n - 1)
+			}
+			return nil
+		}
 		if s.bindingMatches(actionReloadKeybinds, event) {
 			if err := s.reloadKeybindingsConfig(); err != nil {
 				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Keybind reload failed")
