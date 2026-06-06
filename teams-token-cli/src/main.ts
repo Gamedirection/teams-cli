@@ -105,7 +105,7 @@ function waitForRedirect(page: Page): Promise<string> {
 }
 
 async function authorize(page: Page, type: TeamsSkype, tenantId: string): Promise<string> {
-  console.log(`Authorizing ${type} with tenantId=${tenantId}`);
+  log(`Authorizing ${type} with tenantId=${tenantId}`);
   const redirectPromise = waitForRedirect(page);
   await page.setUserAgent(USER_AGENT);
   // Don't await goto — it may never resolve because we intercept the redirect
@@ -124,15 +124,20 @@ async function waitForCDP(port: number): Promise<void> {
   throw new Error(`Carbonyl CDP not available on port ${port} after 15s`);
 }
 
+const log = (msg: string) => process.stderr.write(msg + '\n');
+
 async function main() {
-  // Spawn Carbonyl — renders in this terminal, exposes CDP on debug port
+  const initialURL = getLoginURL('teams', 'common');
+
+  // Pass initial URL so Carbonyl starts rendering immediately instead of blank
   const proc = spawn(carbonylBin, [
     `--remote-debugging-port=${DEBUG_PORT}`,
     '--no-sandbox',
     '--disable-setuid-sandbox',
+    initialURL,
   ], { stdio: 'inherit' });
 
-  proc.on('error', (err) => { console.error('Failed to start Carbonyl:', err.message); process.exit(1); });
+  proc.on('error', (err) => { log('Failed to start Carbonyl: ' + err.message); process.exit(1); });
 
   const cleanup = () => { try { proc.kill(); } catch { /* ignore */ } };
   process.on('exit', cleanup);
@@ -170,10 +175,10 @@ async function main() {
       const decoded = jwt.decode(token) as Record<string, unknown>;
       if (!decoded || typeof decoded === 'string') throw new Error('Invalid JWT');
 
-      console.log(`Audience: ${decoded.aud}`);
+      log(`Audience: ${decoded.aud}`);
 
       if (decoded.tid === MICROSOFT_TENANT_ID && decoded.aud === SKYPE_RESOURCE) {
-        console.log('Resolving real tenant...');
+        log('Resolving real tenant...');
         const tenants = (await getTenants(token)).data;
         currentTenant = tenants[0].tenantId;
         return processHash(await authorize(page, 'skype', currentTenant));
@@ -184,15 +189,15 @@ async function main() {
       }
 
       if (decoded.aud === TEAMS_APP_ID) {
-        console.log('Got Teams token');
+        log('Got Teams token');
         saveToken(token, 'teams');
         return processHash(await authorize(page, 'skype', currentTenant));
       } else if (decoded.aud === SKYPE_RESOURCE) {
-        console.log('Got Skype token');
+        log('Got Skype token');
         saveToken(token, 'skype');
         return processHash(await authorize(page, 'chatsvcagg', currentTenant));
       } else if (decoded.aud === CHAT_SVC_AGG_RESOURCE) {
-        console.log('Got ChatSvcAgg token');
+        log('Got ChatSvcAgg token');
         saveToken(token, 'chatsvcagg');
       } else {
         throw new Error(`Unknown audience: ${decoded.aud}`);
@@ -200,7 +205,7 @@ async function main() {
     };
 
     await processHash(await authorize(page, 'teams', 'common'));
-    console.log('\nAll tokens saved to', CONFIG_DIR);
+    log(`\nAll tokens saved to ${CONFIG_DIR}`);
   } finally {
     browser.disconnect();
     cleanup();
@@ -215,7 +220,7 @@ if (arg === 'logout') {
     const f = join(CONFIG_DIR, `token-${type}.jwt`);
     if (existsSync(f)) {
       unlinkSync(f);
-      console.log(`Removed ${f}`);
+      log(`Removed ${f}`);
     }
   });
   process.exit(0);
