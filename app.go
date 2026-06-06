@@ -248,6 +248,15 @@ func (s *AppState) createApp() {
 		case tcell.KeyBacktab:
 			s.focusPrevPane()
 			return nil
+		case tcell.KeyRune:
+			if event.Rune() == '?' {
+				compose, _ := s.components[ViCompose]
+				if s.app.GetFocus() != compose {
+					s.toggleHelpModal()
+					return nil
+				}
+			}
+			return event
 		default:
 			return event
 		}
@@ -1448,6 +1457,71 @@ func (s *AppState) promptCustomWrapChars(onDone func(value int, ok bool)) {
 
 	s.pages.AddPage("pageWrapCustom", modal, true, true)
 	s.app.SetFocus(input)
+}
+
+func (s *AppState) toggleHelpModal() {
+	if name, _ := s.pages.GetFrontPage(); name == PageHelp {
+		s.pages.RemovePage(PageHelp)
+		return
+	}
+	s.pages.AddPage(PageHelp, s.createHelpModal(), true, true)
+}
+
+func (s *AppState) createHelpModal() tview.Primitive {
+	s.keybindMu.RLock()
+	kb := s.keybindings
+	s.keybindMu.RUnlock()
+
+	key := func(action string) string {
+		keys, ok := kb[action]
+		if !ok || len(keys) == 0 {
+			return "?"
+		}
+		return keys[0]
+	}
+
+	text := tview.NewTextView().
+		SetDynamicColors(true).
+		SetText(
+			"[yellow]Keybindings[-]\n\n" +
+				"[green]Global[-]\n" +
+				"  Tab / Shift+Tab   next / prev pane\n" +
+				"  ?                 toggle this help\n\n" +
+				"[green]Tree pane[-]\n" +
+				"  " + key(actionToggleFavorite) + "                   toggle favorite\n" +
+				"  " + key(actionRefreshTitles) + "                   refresh chat titles\n" +
+				"  " + key(actionMarkUnread) + "                   mark chat unread\n" +
+				"  " + key(actionToggleScan) + "                   toggle unread scan\n" +
+				"  " + key(actionScanNow) + "              scan now\n\n" +
+				"[green]Chat pane[-]\n" +
+				"  " + key(actionReplyMessage) + "                   reply to message\n" +
+				"  " + key(actionReactMessage) + "                   react 👍\n\n" +
+				"[green]Compose[-]\n" +
+				"  " + key(actionFocusCompose) + "                   focus compose\n" +
+				"  Enter              send message\n" +
+				"  Esc                back to tree\n\n" +
+				"[green]Settings[-]\n" +
+				"  " + key(actionReloadKeybinds) + "              reload keybindings\n\n" +
+				"[darkgray]Press ? or Esc to close[-]",
+		)
+	text.SetBorder(true).SetTitle(" Help ").SetTitleAlign(tview.AlignCenter)
+	text.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape || (event.Key() == tcell.KeyRune && event.Rune() == '?') {
+			s.pages.RemovePage(PageHelp)
+			return nil
+		}
+		return event
+	})
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(text, 22, 1, true).
+			AddItem(nil, 0, 1, false), 52, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	return modal
 }
 
 func (s *AppState) formatChatMessageText(content string) string {
