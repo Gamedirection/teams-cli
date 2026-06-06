@@ -3123,12 +3123,28 @@ func (s *AppState) downloadImage(imageURL string) (string, error) {
 	}
 	home := os.Getenv("HOME")
 	configDir := filepath.Join(home, ".config", "fossteams")
-	// Try skype token first (used for media), fall back to teams token
-	for _, name := range []string{"token-skype.jwt", "token-teams.jwt", "token-chatsvcagg.jwt"} {
-		if data, e := os.ReadFile(filepath.Join(configDir, name)); e == nil {
-			req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(data)))
-			break
+
+	skypeData, _ := os.ReadFile(filepath.Join(configDir, "token-skype.jwt"))
+	teamsData, _ := os.ReadFile(filepath.Join(configDir, "token-teams.jwt"))
+	skypeToken := strings.TrimSpace(string(skypeData))
+	teamsToken := strings.TrimSpace(string(teamsData))
+
+	// Teams media CDN (asyncgw, ng.msg.teams) uses skypetoken auth scheme:
+	//   Authentication: skypetoken=<raw_jwt>
+	// Other URLs use standard Bearer token.
+	isMediaCDN := strings.Contains(imageURL, "asyncgw.teams.microsoft.com") ||
+		strings.Contains(imageURL, "ng.msg.teams.microsoft.com") ||
+		strings.Contains(imageURL, "statics.teams.cdn") ||
+		strings.Contains(imageURL, "teams.microsoft.com/v1/objects")
+	if isMediaCDN && skypeToken != "" {
+		req.Header.Set("Authentication", "skypetoken="+skypeToken)
+		if teamsToken != "" {
+			req.Header.Set("Authorization", "Bearer "+teamsToken)
 		}
+	} else if teamsToken != "" {
+		req.Header.Set("Authorization", "Bearer "+teamsToken)
+	} else if skypeToken != "" {
+		req.Header.Set("Authorization", "Bearer "+skypeToken)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
