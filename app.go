@@ -4556,7 +4556,10 @@ func (s *AppState) refreshAuthFromTeamsToken() error {
 	s.authRefreshMu.Lock()
 	defer s.authRefreshMu.Unlock()
 
-	teamsTokenDir := "teams-token"
+	teamsTokenDir := "teams-token-cli"
+	if _, e := os.Stat(teamsTokenDir); e != nil {
+		teamsTokenDir = "teams-token"
+	}
 	info, err := os.Stat(teamsTokenDir)
 	if err != nil || !info.IsDir() {
 		return fmt.Errorf("optional %s directory not found", teamsTokenDir)
