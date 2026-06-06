@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"regexp"
 	"runtime/debug"
 	"sort"
@@ -1067,6 +1068,7 @@ func (s *AppState) fillMainWindow() {
 			s.resetMentionCycle()
 			s.clearPendingReply()
 			s.updateComposeReplyUI()
+			composeView.SetText("")
 			s.app.SetFocus(treeView)
 			return
 		}
@@ -3404,7 +3406,7 @@ func (s *AppState) renderImageChafa(imageURL string) (string, error) {
 		return "", err
 	}
 	// Don't remove — file is cached in ~/.local/share/teams-cli/images/
-	out, err := exec.Command("chafa", "--format", "symbols", "--size", "60x20", path).CombinedOutput()
+	out, err := chafaCmd( "--format", "symbols", "--size", "60x20", path).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("chafa: %v\nfile: %s\noutput: %s", err, path, strings.TrimSpace(string(out)))
 	}
@@ -3414,6 +3416,15 @@ func (s *AppState) renderImageChafa(imageURL string) (string, error) {
 // tviewTagRe matches tview color/style tags like [red], [::b], [-], [#aabbcc].
 var tviewTagRe = regexp.MustCompile(`\[[^\[]*?\]`)
 var privateAnsiRe = regexp.MustCompile(`\x1b\[[?][0-9;]*[a-zA-Z]`)
+
+// chafaCmd builds a chafa exec.Cmd detached from the controlling terminal.
+// Without this, chafa queries the terminal via /dev/tty; responses accumulate
+// in stdin and tview reads them as user input after chafa exits.
+func chafaCmd(args ...string) *exec.Cmd {
+	cmd := exec.Command("chafa", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	return cmd
+}
 
 func urlHashStr(url string) string {
 	h := uint32(2166136261)
@@ -3440,7 +3451,7 @@ func (s *AppState) getInlineThumbnail(imageURL string) string {
 	if cachedPath == "" {
 		return ""
 	}
-	out, err := exec.Command("chafa", "--format", "symbols", "--size", "32x8", cachedPath).Output()
+	out, err := chafaCmd( "--format", "symbols", "--size", "32x8", cachedPath).Output()
 	if err != nil {
 		return ""
 	}
@@ -3931,7 +3942,7 @@ func (s *AppState) openImageInTerminal(item linkItem) {
 				})
 				return
 			}
-			out, chafaErr := exec.Command("chafa", "--format", "symbols",
+			out, chafaErr := chafaCmd( "--format", "symbols",
 				"--size", fmt.Sprintf("%dx%d", cols, rows), path).CombinedOutput()
 
 			s.app.QueueUpdateDraw(func() {
