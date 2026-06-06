@@ -1669,10 +1669,10 @@ func wrapTextLines(text string, width int) []string {
 				lines = append(lines, rest)
 				break
 			}
-			// Find cut point based on visible length, not byte length
+			// Work entirely in rune indices — never mix byte/rune indexing.
 			runes := []rune(rest)
 			visible := 0
-			cutRune := len(runes)
+			cutRune := len(runes) // default: cut at end
 			inTag := false
 			for i, r := range runes {
 				if r == '[' {
@@ -1689,12 +1689,18 @@ func wrapTextLines(text string, width int) []string {
 					}
 				}
 			}
-			segment := string(runes[:cutRune])
-			if idx := strings.LastIndex(segment, " "); idx > 0 {
-				cutRune = idx
-				segment = string(runes[:cutRune])
+			// Find last space before cutRune using rune index (not byte index)
+			lastSpace := -1
+			for i := cutRune - 1; i >= 0; i-- {
+				if runes[i] == ' ' {
+					lastSpace = i
+					break
+				}
 			}
-			lines = append(lines, strings.TrimRight(segment, " "))
+			if lastSpace > 0 {
+				cutRune = lastSpace
+			}
+			lines = append(lines, strings.TrimRight(string(runes[:cutRune]), " "))
 			rest = strings.TrimLeft(string(runes[cutRune:]), " ")
 		}
 	}
