@@ -4,7 +4,7 @@
 - [ ] **Token auto-refresh on 401**: currently the "Run teams-token" button tries to launch Electron headlessly (fails). Options:
   - Detect 401, show clear "run: cd /opt/teams-cli/teams-token-cli && yarn start" message
   - Or launch Carbonyl auth in a new terminal window automatically
-- [ ] **Terminal image rendering**: auth works (confirmed via curl), but app still hits 401. Likely a token-at-startup issue — images only work if tokens are fresh when `teams-cli` launches. Fix: refresh `fetchShortSkypeToken` result instead of using one from startup.
+- [x] **Terminal image rendering**: ✅ SOLVED — uses curl with `skypetoken_asm` cookie (without Authorization: Bearer which was causing 401). Images render via chafa with `+`/`-` resize.
 - [ ] **Unread count badges**: show unread message count next to chat name in tree
 
 ## Medium Priority
@@ -43,8 +43,7 @@ All image display approaches tried and current status:
 | 4 | `api.GetSkypeToken()` → `Cookie: skypetoken_asm=<jwt>` | 401 — still the JWT, not short token |
 | 5 | Direct POST to `/api/authsvc/v1.0/authz` (wrong URL `/authsvc/...` without `/api/`) | 405 Method Not Allowed |
 | 6 | Direct POST to `/api/authsvc/v1.0/authz` (correct URL) → `Cookie: skypetoken_asm=<short_token>` | **200 ✓ confirmed via curl** |
-| 7 | Same as 6 but in-app | 401 — tokens may be stale at time of image request |
+| 7 | Same as 6 but Go `http.Client` instead of curl | 401 — Go HTTP client sent both cookie AND `Authorization: Bearer` which overrode cookie auth |
+| 8 | `curl` with ONLY `--cookie skypetoken_asm=<short>` + `-H Authentication: skypetoken=<short>`, NO `Authorization: Bearer` | **200 ✓ WORKING** |
 
-**Root cause of remaining issue**: `fetchShortSkypeToken` exchange is correct but the resulting token may expire between app startup and when the image is requested, OR the app's startup-loaded token is different from a freshly exchanged one.
-
-**Next step**: Cache the short token with its expiry and re-fetch when expired, rather than fetching once per image download.
+**Root cause**: The `Authorization: Bearer <jwt>` header was conflicting with and overriding the `skypetoken_asm` cookie. Removing `Authorization` makes it work. Use `curl` subprocess (not Go http.Client) to match exact curl behavior.

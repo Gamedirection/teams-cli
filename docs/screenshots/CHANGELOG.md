@@ -1,6 +1,6 @@
 # Changelog
 
-## [v1.2.0] - 2026-06-06
+## [v1.2.0] - 2026-06-06 (ongoing)
 
 ### Added
 - **Emoji reactions**: `e` key opens a picker (👍 ❤️ 😆 😮 😢 😠). Unknown reaction types fall back to 👍.
@@ -17,12 +17,13 @@
 - **`G` in tree pane**: jump to and open the most recently active chat.
 - **`G` in chat pane**: scroll to the bottom (most recent message).
 - **`chafa` auto-install**: install script detects pacman/apt/dnf/zypper and installs chafa if missing.
+- **Image resize**: `+` / `-` in terminal image view to grow/shrink; re-renders chafa at new size. Esc to close.
 
 ### Changed
 - `textMessage()` rewritten as HTML-to-tview converter (preserves formatting, emoji, images).
 - `wrapTextLines()` uses rune-based visible-length measurement so tview markup tags don't break wrapping.
 - Message rendering uses `QueueUpdateDraw` for reliable scroll-to-bottom on load.
-- Image CDN auth: `fetchShortSkypeToken()` does the `/api/authsvc/v1.0/authz` exchange and sends result as `Cookie: skypetoken_asm` (confirmed working via curl testing).
+- Image CDN auth: uses `curl` subprocess with `skypetoken_asm` cookie only — `Authorization: Bearer` header was conflicting and causing 401. Root cause took 8 attempts to isolate (see `docs/TODO.md`).
 - Images cached to disk by URL hash — same image won't re-download.
 
 ### Fixed

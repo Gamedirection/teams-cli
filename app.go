@@ -3872,54 +3872,89 @@ func (s *AppState) showImageOptionsModal(item linkItem) {
 	s.app.SetFocus(list)
 }
 
+func clampInt(v, lo, hi int) int {
+	if v < lo { return lo }
+	if v > hi { return hi }
+	return v
+}
+
 func (s *AppState) openImageInTerminal(item linkItem) {
 	composeView, _ := s.components[ViCompose].(*tview.InputField)
 	if composeView != nil {
 		composeView.SetTitle(s.composeTitleWithScanStatus() + " | Loading image...")
 	}
-	go func() {
-		defer func() { recover() }() //nolint
-		rendered, err := s.renderImageChafa(item.url)
-		s.app.QueueUpdateDraw(func() {
-			defer func() { recover() }() //nolint — protect main goroutine from ANSIWriter panics
-			if composeView != nil {
-				composeView.SetTitle(s.composeTitleWithScanStatus())
-			}
-			if err != nil {
-				if composeView != nil {
-					composeView.SetTitle(s.composeTitleWithScanStatus() + " | Image load failed: " + err.Error())
-				}
+
+	privateSeqRe := regexp.MustCompile(`\x1b\[[?][0-9;]*[a-zA-Z]`)
+
+	// renderAt runs chafa at given size and shows the modal.
+	// Declared as var so the input handler can call it recursively.
+	var renderAt func(cols, rows int)
+	renderAt = func(cols, rows int) {
+		go func() {
+			defer func() { recover() }() //nolint
+			// Download once, re-render chafa at new size
+			path, dlErr := s.downloadImage(item.url)
+			if dlErr != nil {
+				s.app.QueueUpdateDraw(func() {
+					if composeView != nil {
+						composeView.SetTitle(s.composeTitleWithScanStatus() + " | Image load failed: " + dlErr.Error())
+					}
+				})
 				return
 			}
-			// Strip cursor-hide/show and other private ANSI sequences chafa emits
-			// that tview.ANSIWriter cannot handle ([?25l, [?25h, etc.)
-			privateSeqRe := regexp.MustCompile(`\x1b\[[?][0-9;]*[a-zA-Z]`)
-			clean := privateSeqRe.ReplaceAllString(rendered, "")
+			out, chafaErr := exec.Command("chafa", "--format", "symbols",
+				"--size", fmt.Sprintf("%dx%d", cols, rows), path).CombinedOutput()
 
-			tv := tview.NewTextView().
-				SetDynamicColors(true).
-				SetScrollable(true)
-			w := tview.ANSIWriter(tv)
-			fmt.Fprint(w, clean)
-			tv.SetBorder(true).SetTitle(" "+item.text+" (Esc to close) ").SetTitleAlign(tview.AlignCenter)
-			tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-				if event.Key() == tcell.KeyEscape {
-					s.pages.RemovePage(PageImageView)
-					return nil
+			s.app.QueueUpdateDraw(func() {
+				defer func() { recover() }() //nolint
+				if composeView != nil {
+					composeView.SetTitle(s.composeTitleWithScanStatus())
 				}
-				return event
-			})
-			modal := tview.NewFlex().
-				AddItem(nil, 0, 1, false).
-				AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+				if chafaErr != nil {
+					if composeView != nil {
+						composeView.SetTitle(s.composeTitleWithScanStatus() + " | chafa error: " + chafaErr.Error())
+					}
+					return
+				}
+				clean := privateSeqRe.ReplaceAllString(string(out), "")
+				tv := tview.NewTextView().SetDynamicColors(true).SetScrollable(true)
+				fmt.Fprint(tview.ANSIWriter(tv), clean)
+				tv.SetBorder(true).
+					SetTitle(fmt.Sprintf(" %s  +/- resize  Esc close ", item.text)).
+					SetTitleAlign(tview.AlignCenter)
+				tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+					switch {
+					case event.Key() == tcell.KeyEscape:
+						s.pages.RemovePage(PageImageView)
+						return nil
+					case event.Key() == tcell.KeyRune && event.Rune() == '+':
+						s.pages.RemovePage(PageImageView)
+						renderAt(clampInt(cols+20, 20, 300), clampInt(rows+10, 5, 100))
+						return nil
+					case event.Key() == tcell.KeyRune && event.Rune() == '-':
+						s.pages.RemovePage(PageImageView)
+						renderAt(clampInt(cols-20, 20, 300), clampInt(rows-10, 5, 100))
+						return nil
+					}
+					return event
+				})
+				// Modal width = cols + 4 border; height = rows + 4 border
+				mw := clampInt(cols+4, 30, 300)
+				mh := clampInt(rows+4, 10, 100)
+				modal := tview.NewFlex().
 					AddItem(nil, 0, 1, false).
-					AddItem(tv, 24, 1, true).
-					AddItem(nil, 0, 1, false), 66, 1, true).
-				AddItem(nil, 0, 1, false)
-			s.pages.AddPage(PageImageView, modal, true, true)
-			s.app.SetFocus(tv)
-		})
-	}()
+					AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+						AddItem(nil, 0, 1, false).
+						AddItem(tv, mh, 1, true).
+						AddItem(nil, 0, 1, false), mw, 1, true).
+					AddItem(nil, 0, 1, false)
+				s.pages.AddPage(PageImageView, modal, true, true)
+				s.app.SetFocus(tv)
+			})
+		}()
+	}
+
+	renderAt(60, 20)
 }
 
 func (s *AppState) sendReaction(message csa.ChatMessage, reaction string) error {

@@ -179,6 +179,8 @@ We explored "all-in-terminal" auth alternatives and recorded the outcomes:
 | `e` | chat | open reaction picker (👍 ❤️ 😆 😮 😢 😠) |
 | `o` | chat | open link or image picker |
 | `G` | chat | scroll to bottom (most recent message) |
+| `+` / `-` | image view | grow / shrink terminal image |
+| `Esc` | image view | close image |
 | `Enter` | compose | send message |
 | `Esc` | compose | back to tree |
 
