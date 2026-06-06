@@ -56,8 +56,9 @@ jobs:
             --appdir AppDir \
             --output appimage
 
-          # Rename to include version
+          # Rename to include version; remove linuxdeploy from artifacts
           mv teams-cli-x86_64.AppImage teams-cli-${VERSION}-x86_64.AppImage
+          rm -f linuxdeploy-x86_64.AppImage
 
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v4
