@@ -71,34 +71,46 @@ function waitForRedirect(page: Page): Promise<string> {
   return new Promise((resolve, reject) => {
     let settled = false;
 
-    const handler = (frame: Frame) => {
-      if (frame !== page.mainFrame()) return;
-      const url = frame.url();
-      if (!url.startsWith('https://teams.microsoft.com/go')) return;
-
-      page.off('framenavigated', handler);
+    const settle = (hash: string) => {
       if (settled) return;
       settled = true;
-
-      const hash = url.includes('#') ? url.split('#')[1] : '';
-      if (!hash) {
-        // Try to get hash from page JS in case framenavigated fired before hash was set
-        page.evaluate(() => window.location.hash.replace(/^#/, '')).then(h => {
-          resolve(h || '');
-        }).catch(() => resolve(''));
-        return;
-      }
+      // Navigate away immediately to prevent Teams web app loading in terminal
+      page.goto('about:blank').catch(() => {});
       resolve(hash);
     };
 
-    page.on('framenavigated', handler);
+    // Primary: intercept the 302 Location header — hash is guaranteed to be here
+    const responseHandler = async (response) => {
+      const status = response.status();
+      if (![301, 302, 303, 307, 308].includes(status)) return;
+      const location = response.headers()['location'] || '';
+      if (!location.startsWith('https://teams.microsoft.com/go')) return;
+      page.off('response', responseHandler);
+      page.off('framenavigated', navHandler);
+      const hash = location.includes('#') ? location.split('#')[1] : '';
+      settle(hash);
+    };
 
-    // Timeout after 5 minutes
+    // Fallback: framenavigated in case response event misses it
+    const navHandler = async (frame: Frame) => {
+      if (frame !== page.mainFrame()) return;
+      const url = frame.url();
+      if (!url.startsWith('https://teams.microsoft.com/go')) return;
+      page.off('response', responseHandler);
+      page.off('framenavigated', navHandler);
+      const hash = url.includes('#') ? url.split('#')[1] : '';
+      settle(hash);
+    };
+
+    page.on('response', responseHandler);
+    page.on('framenavigated', navHandler);
+
     setTimeout(() => {
       if (!settled) {
         settled = true;
-        page.off('framenavigated', handler);
-        reject(new Error('Timed out waiting for Teams auth redirect'));
+        page.off('response', responseHandler);
+        page.off('framenavigated', navHandler);
+        reject(new Error('Timed out waiting for Teams auth redirect (5 min)'));
       }
     }, 5 * 60 * 1000);
   });
