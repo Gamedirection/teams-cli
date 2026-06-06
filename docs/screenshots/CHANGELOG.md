@@ -1,6 +1,6 @@
 # Changelog
 
-## [v1.2.0] - 2026-06-06 (ongoing)
+## [v1.2.0] - 2026-06-06
 
 ### Added
 - **Emoji reactions**: `e` key opens a picker (👍 ❤️ 😆 😮 😢 😠). Unknown reaction types fall back to 👍.
@@ -26,6 +26,11 @@
 - Message rendering uses `QueueUpdateDraw` for reliable scroll-to-bottom on load.
 - Image CDN auth: uses `curl` subprocess with `skypetoken_asm` cookie only — `Authorization: Bearer` header was conflicting and causing 401. Root cause took 8 attempts to isolate (see `docs/TODO.md`).
 - Images cached to disk by URL hash — same image won't re-download.
+
+### Planned (tracked in docs/TODO.md)
+- Scheduled message sending
+- Calendar/meeting view
+- Audio (stretch goal — microphone/speaker, Teams call signaling)
 
 ### Fixed
 - `wrapTextLines` panic: `strings.LastIndex` returns byte index, used as rune index → slice-out-of-bounds. Fixed with rune-based space search.

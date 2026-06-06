@@ -227,11 +227,18 @@ In-app keybinding editor notes:
 
 ## Feature Roadmap
 
-Planned messaging/UX improvements:
-- TTS playback for messages
-- Inline image viewer for chat attachments
-- Better unread detection and sync accuracy
-- Scroll/pagination for long chat histories
+See [`docs/TODO.md`](docs/TODO.md) for the full backlog. Highlights:
+
+**Planned**
+- Scheduled messages — compose + set future send time
+- Calendar view — upcoming meetings/events in the tree
+- Search — fuzzy search across chats and messages
+- Message pagination — load older history on scroll-up
+- File attachment download support
+
+**Stretch Goals**
+- Audio — in-call microphone/speaker via PulseAudio/PipeWire bridge to Teams media stack (very complex)
+- TTS — read incoming messages aloud via `espeak-ng`/`festival`
 
 ## Packaging Roadmap
 

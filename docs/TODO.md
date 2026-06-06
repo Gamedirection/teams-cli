@@ -8,6 +8,8 @@
 - [ ] **Unread count badges**: show unread message count next to chat name in tree
 
 ## Medium Priority
+- [ ] **Scheduled Messages**: compose a message and set a future send time. Needs investigation into whether the Teams API exposes a schedule endpoint or if we implement a local scheduler (cron/at) that sends via the existing message API.
+- [ ] **Calendar integration**: view upcoming meetings/events from the Teams calendar. Investigate `GET /api/mt/.../users/me/calendarEvents` or Graph API. Display in a new tree section or modal (keybind `c`?).
 - [ ] **Search**: fuzzy search across chats and messages
 - [ ] **Notification sound**: play a sound on new message
 - [ ] **Message pagination**: load older messages on scroll-up
@@ -18,11 +20,14 @@
 - [ ] **File attachments**: detect `<attachment>` tags in messages, show download option
 
 ## Low Priority / Nice to Have
-- [ ] **TTS playback**: read messages aloud
 - [ ] **Inline image preview via Kitty/iTerm2 protocol**: instead of chafa symbols, use actual pixel image rendering if terminal supports it
 - [ ] **Carbonyl auto-refresh**: when 401 occurs, spawn Carbonyl in a new terminal for re-auth without restarting teams-cli
 - [ ] **Device code flow**: register a new Azure AD app that allows device code flow — true headless auth with no browser at all
 - [ ] **Merge Carbonyl branch**: once headless token refresh is solved, merge `feat/carbonyl-auth` to master
+
+## Stretch Goals (Future)
+- [ ] **Audio**: in-call audio via terminal. Extremely complex — requires microphone/speaker access, codec support, and Teams call signaling (ICE/SRTP). Likely needs a separate background process bridging PulseAudio/PipeWire to Teams' media stack. Investigate `teams-api` call endpoints as a first step.
+- [ ] **TTS (Text-to-Speech)**: read incoming messages aloud using `espeak-ng` or `festival`. Simpler than full audio, could be an accessibility feature.
 
 ## Packaging
 - [ ] `pacman` AUR package
