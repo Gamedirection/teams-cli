@@ -1034,6 +1034,7 @@ func (s *AppState) fillMainWindow() {
 		if messageText == "" {
 			return
 		}
+		messageText = expandImageTags(messageText)
 		ids, title, selectedNode := s.getActiveConversation()
 		if len(ids) == 0 {
 			s.showError(fmt.Errorf("select a conversation before sending a message"))
@@ -3153,6 +3154,39 @@ func (s *AppState) sendMessageAndRefresh(conversationIDs []string, displayName, 
 	}
 }
 
+// expandImageTags replaces <img>~/path/to/file</img> with an HTML img tag (base64).
+func expandImageTags(content string) string {
+	imgRe := regexp.MustCompile(`(?i)<img>(.*?)</img>`)
+	return imgRe.ReplaceAllStringFunc(content, func(match string) string {
+		sub := imgRe.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		rawPath := strings.TrimSpace(sub[1])
+		if strings.HasPrefix(rawPath, "~/") {
+			rawPath = filepath.Join(os.Getenv("HOME"), rawPath[2:])
+		}
+		data, err := os.ReadFile(rawPath)
+		if err != nil {
+			return "[image not found: " + rawPath + "]"
+		}
+		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(rawPath), "."))
+		mime := "image/png"
+		switch ext {
+		case "jpg", "jpeg":
+			mime = "image/jpeg"
+		case "gif":
+			mime = "image/gif"
+		case "webp":
+			mime = "image/webp"
+		case "svg":
+			mime = "image/svg+xml"
+		}
+		encoded := base64.StdEncoding.EncodeToString(data)
+		return fmt.Sprintf(`<img src="data:%s;base64,%s" alt="%s"/>`, mime, encoded, filepath.Base(rawPath))
+	})
+}
+
 func formatOutgoingHTML(content string, reply *replyTarget) string {
 	lines := strings.Split(content, "\n")
 	for i := range lines {
@@ -3437,9 +3471,11 @@ func (s *AppState) openImageInTerminal(item linkItem) {
 				return
 			}
 			tv := tview.NewTextView().
-				SetText(rendered).
-				SetDynamicColors(false).
+				SetDynamicColors(true).
 				SetScrollable(true)
+			// Write chafa ANSI output through ANSIWriter so escape codes render
+			w := tview.ANSIWriter(tv)
+			fmt.Fprint(w, rendered)
 			tv.SetBorder(true).SetTitle(" "+item.text+" (Esc to close) ").SetTitleAlign(tview.AlignCenter)
 			tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 				if event.Key() == tcell.KeyEscape {
