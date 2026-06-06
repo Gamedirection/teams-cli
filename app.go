@@ -569,6 +569,16 @@ func (s *AppState) fillMainWindow() {
 	treeView := s.components[TrChat].(*tview.TreeView)
 	composeView := s.components[ViCompose].(*tview.InputField)
 	rootNode := tview.NewTreeNode("Conversations")
+
+	// Own status node — sits above Teams/Chats, updated after presence fetch
+	myName := "You"
+	if s.me != nil && strings.TrimSpace(s.me.DisplayName) != "" {
+		myName = strings.TrimSpace(s.me.DisplayName)
+	}
+	statusNode := tview.NewTreeNode("[gray]○[-] " + myName + " — loading status...")
+	statusNode.SetReference("__status__")
+	rootNode.AddChild(statusNode)
+
 	teamsNode := tview.NewTreeNode("Teams")
 	teamsNode.SetColor(tcell.ColorBlue)
 	chatsNode := tview.NewTreeNode("Chats")
@@ -826,6 +836,16 @@ func (s *AppState) fillMainWindow() {
 				return nil
 			}
 			return event
+		}
+		if event.Key() == tcell.KeyRune && event.Rune() == 'e' {
+			selected := treeView.GetCurrentNode()
+			if selected != nil {
+				if ref, ok := selected.GetReference().(string); ok && ref == "__status__" {
+					s.showStatusPickerModal(selected, treeView)
+					return nil
+				}
+			}
+			// fall through to chat reaction handler
 		}
 		if event.Key() == tcell.KeyRune && event.Rune() == 'g' {
 			selected := treeView.GetCurrentNode()
@@ -1120,8 +1140,151 @@ func (s *AppState) fillMainWindow() {
 	s.startUnreadScanLoop(chatsNode)
 	s.logger.Info("main window ready")
 
-	// Fetch presence for all DM members in the background
-	go s.refreshAllPresence(chatsNode)
+	// Fetch own presence and update the status node
+	go s.refreshOwnPresence(rootNode, treeView)
+}
+
+func statusNodeText(displayName, availability string) string {
+	dot := presenceDot(availability)
+	if dot == "" {
+		dot = "[gray]○[-]"
+	}
+	label := availability
+	switch strings.ToLower(availability) {
+	case "available":
+		label = "Available"
+	case "busy":
+		label = "Busy"
+	case "donotdisturb":
+		label = "Do Not Disturb"
+	case "away":
+		label = "Away"
+	case "berightback":
+		label = "Be Right Back"
+	case "outofoffice":
+		label = "Out of Office"
+	case "offline", "presenceunknown", "":
+		label = "Offline"
+	}
+	return dot + " " + displayName + " — " + label
+}
+
+func (s *AppState) refreshOwnPresence(rootNode *tview.TreeNode, treeView *tview.TreeView) {
+	if s.me == nil {
+		return
+	}
+	mri := strings.ToLower(strings.TrimSpace(s.me.Mri))
+	if mri == "" {
+		return
+	}
+	s.fetchPresenceBatch([]string{mri})
+	avail := s.getPresence(mri)
+
+	myName := strings.TrimSpace(s.me.DisplayName)
+	if myName == "" {
+		myName = "You"
+	}
+	text := statusNodeText(myName, avail)
+
+	s.app.QueueUpdateDraw(func() {
+		for _, child := range rootNode.GetChildren() {
+			if ref, ok := child.GetReference().(string); ok && ref == "__status__" {
+				child.SetText(text)
+				return
+			}
+		}
+	})
+}
+
+func (s *AppState) setMyPresence(availability string) {
+	home := os.Getenv("HOME")
+	shortToken := s.fetchShortSkypeToken(filepath.Join(home, ".config", "fossteams"))
+	if shortToken == "" {
+		return
+	}
+	activity := availability
+	body, _ := json.Marshal(map[string]string{
+		"availability": availability,
+		"activity":     activity,
+		"deviceType":   "Desktop",
+	})
+	req, err := http.NewRequest("PUT",
+		"https://presence.teams.microsoft.com/v1/me/forcesignin",
+		bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authentication", "skypetoken="+shortToken)
+	resp, _ := http.DefaultClient.Do(req)
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	// Update local cache
+	if s.me != nil {
+		mri := strings.ToLower(strings.TrimSpace(s.me.Mri))
+		s.presenceMu.Lock()
+		s.presence[mri] = availability
+		s.presenceMu.Unlock()
+	}
+}
+
+const pageStatusPicker = "pageStatusPicker"
+
+func (s *AppState) showStatusPickerModal(statusNode *tview.TreeNode, treeView *tview.TreeView) {
+	type option struct {
+		availability string
+		label        string
+	}
+	options := []option{
+		{"Available", "[green]●[-]  Available"},
+		{"Busy", "[red]●[-]  Busy"},
+		{"DoNotDisturb", "[red]●[-]  Do Not Disturb"},
+		{"BeRightBack", "[yellow]●[-]  Be Right Back"},
+		{"Away", "[yellow]●[-]  Away"},
+		{"Offline", "[gray]○[-]  Appear Offline"},
+	}
+
+	list := tview.NewList().ShowSecondaryText(false)
+	list.SetBorder(true).SetTitle(" Set My Status ").SetTitleAlign(tview.AlignCenter)
+
+	for _, opt := range options {
+		o := opt
+		list.AddItem(o.label, "", 0, func() {
+			s.pages.RemovePage(pageStatusPicker)
+			go func() {
+				s.setMyPresence(o.availability)
+				myName := "You"
+				if s.me != nil && strings.TrimSpace(s.me.DisplayName) != "" {
+					myName = strings.TrimSpace(s.me.DisplayName)
+				}
+				text := statusNodeText(myName, o.availability)
+				s.app.QueueUpdateDraw(func() {
+					statusNode.SetText(text)
+				})
+			}()
+		})
+	}
+
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			s.pages.RemovePage(pageStatusPicker)
+			return nil
+		}
+		return event
+	})
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(list, 10, 1, true).
+			AddItem(nil, 0, 1, false), 32, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	s.pages.AddPage(pageStatusPicker, modal, true, true)
+	s.app.SetFocus(list)
 }
 
 func (s *AppState) refreshAllPresence(chatsNode *tview.TreeNode) {
