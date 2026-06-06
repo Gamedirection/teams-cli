@@ -23,8 +23,9 @@ const (
 // Pages
 
 const (
-	PageMain  = "pageMain"
-	PageLogin = "pageLogin"
-	PageError = "pageError"
-	PageHelp  = "pageHelp"
+	PageMain            = "pageMain"
+	PageLogin           = "pageLogin"
+	PageError           = "pageError"
+	PageHelp            = "pageHelp"
+	PageReactionPicker  = "pageReactionPicker"
 )

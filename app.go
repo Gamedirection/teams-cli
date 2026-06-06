@@ -950,8 +950,7 @@ func (s *AppState) fillMainWindow() {
 				composeView.SetTitle(s.composeTitleWithScanStatus() + " | Select a message first")
 				return nil
 			}
-			go s.reactToMessage(msg, defaultReactionKey)
-			composeView.SetTitle(s.composeTitleWithScanStatus() + " | Reacted 👍")
+			s.showReactionPickerModal(msg)
 			return nil
 		}
 		if s.bindingMatches(actionReloadKeybinds, event) {
@@ -1555,7 +1554,7 @@ func (s *AppState) createHelpModal() tview.Primitive {
 				"  " + key(actionScanNow) + "              scan now\n\n" +
 				"[green]Chat pane[-]\n" +
 				"  " + key(actionReplyMessage) + "                   reply to message\n" +
-				"  " + key(actionReactMessage) + "                   react 👍\n\n" +
+				"  " + key(actionReactMessage) + "                   react (picker)\n\n" +
 				"[green]Compose[-]\n" +
 				"  " + key(actionFocusCompose) + "                   focus compose\n" +
 				"  Enter              send message\n" +
@@ -2783,12 +2782,31 @@ func (s *AppState) formatMessageReactionsOnly(message csa.ChatMessage) string {
 		if name == "" {
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("%s(%d)", name, len(emotion.Users)))
+		parts = append(parts, fmt.Sprintf("%s %d", reactionToEmoji(name), len(emotion.Users)))
 	}
 	if local := s.getLocalMessageReaction(message.ConversationId, message.Id); local != "" {
-		parts = append(parts, "you:"+local)
+		parts = append(parts, reactionToEmoji(local))
 	}
 	return strings.Join(parts, ", ")
+}
+
+func reactionToEmoji(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "like":
+		return "👍"
+	case "heart":
+		return "❤️"
+	case "laugh":
+		return "😆"
+	case "surprised":
+		return "😮"
+	case "sad":
+		return "😢"
+	case "angry":
+		return "😠"
+	default:
+		return name
+	}
 }
 
 func (s *AppState) setPendingReply(reply *replyTarget) {
@@ -3139,6 +3157,52 @@ func (s *AppState) reactToMessage(message csa.ChatMessage, reaction string) {
 	if len(ids) > 0 {
 		s.loadConversationsByIDs(node, ids, title)
 	}
+}
+
+func (s *AppState) showReactionPickerModal(msg csa.ChatMessage) {
+	type reactionOption struct {
+		key   string
+		emoji string
+		label string
+	}
+	options := []reactionOption{
+		{"like", "👍", "Like"},
+		{"heart", "❤️", "Heart"},
+		{"laugh", "😆", "Laugh"},
+		{"surprised", "😮", "Surprised"},
+		{"sad", "😢", "Sad"},
+		{"angry", "😠", "Angry"},
+	}
+
+	list := tview.NewList().ShowSecondaryText(false)
+	list.SetBorder(true).SetTitle(" React ").SetTitleAlign(tview.AlignCenter)
+
+	for _, opt := range options {
+		o := opt
+		list.AddItem(o.emoji+"  "+o.label, "", 0, func() {
+			s.pages.RemovePage(PageReactionPicker)
+			go s.reactToMessage(msg, o.key)
+		})
+	}
+
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			s.pages.RemovePage(PageReactionPicker)
+			return nil
+		}
+		return event
+	})
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(list, 10, 1, true).
+			AddItem(nil, 0, 1, false), 24, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	s.pages.AddPage(PageReactionPicker, modal, true, true)
+	s.app.SetFocus(list)
 }
 
 func (s *AppState) sendReaction(message csa.ChatMessage, reaction string) error {
