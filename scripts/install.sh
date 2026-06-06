@@ -22,6 +22,22 @@ for dep in git go node; do
   fi
 done
 
+# Install chafa (terminal image viewer) if missing
+if ! command -v chafa >/dev/null 2>&1; then
+  echo "Installing chafa (terminal image viewer)..."
+  if command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm chafa
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get install -y chafa
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y chafa
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive in chafa
+  else
+    echo "Warning: chafa not found and no supported package manager detected. Install chafa manually for terminal image viewing."
+  fi
+fi
+
 # Clone or update repo
 if [[ -d "${INSTALL_DIR}/.git" ]]; then
   git -C "${INSTALL_DIR}" fetch --all --tags

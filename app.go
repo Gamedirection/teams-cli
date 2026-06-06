@@ -833,15 +833,24 @@ func (s *AppState) fillMainWindow() {
 			return event
 		}
 		if event.Key() == tcell.KeyRune && event.Rune() == 'G' {
-			// Jump to most recent chat (first child of recentNode)
-			children := recentNode.GetChildren()
-			if len(children) == 0 {
-				// Fall back to first child of favoritesNode
-				children = favoritesNode.GetChildren()
+			candidates := recentNode.GetChildren()
+			if len(candidates) == 0 {
+				candidates = favoritesNode.GetChildren()
 			}
-			if len(children) > 0 {
-				treeView.SetCurrentNode(children[0])
-				treeView.GetCurrentNode() // trigger focus update
+			if len(candidates) > 0 {
+				node := candidates[0]
+				treeView.SetCurrentNode(node)
+				if ref, ok := node.GetReference().(conversationRef); ok && len(ref.ids) > 0 {
+					ref.isUnread = false
+					node.SetText(formatChatTreeTitle(ref.title, false))
+					node.SetReference(ref)
+					s.components[ViChat].(*tview.List).
+						SetTitle(ref.title).
+						SetBorder(true).
+						SetTitleAlign(tview.AlignCenter)
+					s.setActiveConversation(node, ref.ids, ref.title)
+					go s.loadConversationsByIDs(node, ref.ids, ref.title)
+				}
 			}
 			return nil
 		}
