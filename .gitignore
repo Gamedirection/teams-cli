@@ -5,3 +5,5 @@
 .cache/go-build/*
 ./.cache
 .cache/
+teams-token-cli/node_modules/
+teams-token-cli/dist/

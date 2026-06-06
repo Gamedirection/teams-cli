@@ -1,0 +1,33 @@
+{
+  "name": "teams-token",
+  "version": "2.0.0",
+  "description": "Get your MS Teams token easily (terminal-only, no desktop required)",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "start": "yarn run build && node ./dist/main.js",
+    "logout": "node ./dist/main.js logout",
+    "get-url": "node ./dist/main.js get-url"
+  },
+  "author": "Denys Vitali",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^0.21.1",
+    "carbonyl": "^0.0.2-next.bacf3db",
+    "jsonwebtoken": "^8.5.1",
+    "puppeteer-core": "^25.1.0",
+    "uuid": "^8.3.2"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^8.5.1",
+    "@types/uuid": "^8.3.0",
+    "@typescript-eslint/parser": "^4.20.0",
+    "eslint": "^7.23.0",
+    "eslint-config-airbnb": "^18.2.1",
+    "eslint-plugin-import": "^2.22.1",
+    "eslint-plugin-jsx-a11y": "^6.4.1",
+    "eslint-plugin-react": "^7.23.1",
+    "typescript": "^6.0.3"
+  }
+}
